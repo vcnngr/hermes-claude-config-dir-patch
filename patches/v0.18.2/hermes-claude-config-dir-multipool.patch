@@ -1,0 +1,898 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 689d010..e5ddb25 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -11,6 +11,7 @@ Auth supports:
+ """
+ 
+ import copy
++import hashlib
+ import json
+ import logging
+ import os
+@@ -869,12 +870,46 @@ def build_anthropic_bedrock_client(region: str):
+     )
+ 
+ 
+-def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
++def resolve_claude_config_dir(config_dir: Optional[Any] = None) -> Path:
++    """Return the Claude Code config directory used for one credential source."""
++    raw = config_dir
++    if raw is None or not str(raw).strip():
++        raw = os.getenv("CLAUDE_CONFIG_DIR", "")
++    if raw and str(raw).strip():
++        path = Path(os.path.expandvars(str(raw))).expanduser()
++    else:
++        path = Path.home() / ".claude"
++    try:
++        return path.resolve(strict=False)
++    except OSError:
++        return path.absolute()
++
++
++def claude_code_keychain_service(config_dir: Optional[Any] = None) -> str:
++    """Return Claude Code's config-scoped macOS Keychain service name."""
++    resolved = resolve_claude_config_dir(config_dir)
++    suffix = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:8]
++    return f"Claude Code-credentials-{suffix}"
++
++
++def claude_code_pool_source(config_dir: Optional[Any] = None) -> str:
++    """Return a stable pool source id, preserving the legacy default id."""
++    resolved = resolve_claude_config_dir(config_dir)
++    default_dir = resolve_claude_config_dir(Path.home() / ".claude")
++    if resolved == default_dir:
++        return "claude_code"
++    return f"claude_code:{hashlib.sha256(str(resolved).encode('utf-8')).hexdigest()[:8]}"
++
++
++def _read_claude_code_credentials_from_keychain(
++    config_dir: Optional[Any] = None,
++) -> Optional[Dict[str, Any]]:
+     """Read Claude Code OAuth credentials from the macOS Keychain.
+ 
+-    Claude Code >=2.1.114 stores credentials in the macOS Keychain under the
+-    service name "Claude Code-credentials" rather than (or in addition to)
+-    the JSON file at ~/.claude/.credentials.json.
++    Current Claude Code versions scope the Keychain service to the absolute
++    config-directory hash. The legacy unsuffixed service remains a fallback
++    for the default ~/.claude directory only, so an alternate directory can
++    never accidentally borrow the default account.
+ 
+     The password field contains a JSON string with the same claudeAiOauth
+     structure as the JSON file.
+@@ -884,61 +919,68 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+     if platform.system() != "Darwin":
+         return None
+ 
+-    try:
+-        # Read the "Claude Code-credentials" generic password entry
+-        result = subprocess.run(
+-            ["security", "find-generic-password",
+-             "-s", "Claude Code-credentials",
+-             "-w"],
+-            capture_output=True,
+-            text=True,
+-            timeout=5,
+-            stdin=subprocess.DEVNULL,
+-        )
+-    except (OSError, subprocess.TimeoutExpired):
+-        logger.debug("Keychain: security command not available or timed out")
+-        return None
++    resolved_dir = resolve_claude_config_dir(config_dir)
++    services = [claude_code_keychain_service(resolved_dir)]
++    if resolved_dir == resolve_claude_config_dir(Path.home() / ".claude"):
++        services.append("Claude Code-credentials")
+ 
+-    if result.returncode != 0:
+-        logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
+-        return None
++    for service in services:
++        try:
++            result = subprocess.run(
++                ["security", "find-generic-password", "-s", service, "-w"],
++                capture_output=True,
++                text=True,
++                timeout=5,
++                stdin=subprocess.DEVNULL,
++            )
++        except (OSError, subprocess.TimeoutExpired):
++            logger.debug("Keychain: security command not available or timed out")
++            return None
+ 
+-    raw = result.stdout.strip()
+-    if not raw:
+-        return None
++        if result.returncode != 0:
++            logger.debug("Keychain: no entry found for %r", service)
++            continue
+ 
+-    try:
+-        data = json.loads(raw)
+-    except json.JSONDecodeError:
+-        logger.debug("Keychain: credentials payload is not valid JSON")
+-        return None
++        raw = result.stdout.strip()
++        if not isinstance(raw, (str, bytes, bytearray)) or not raw:
++            continue
+ 
+-    oauth_data = data.get("claudeAiOauth")
+-    if oauth_data and isinstance(oauth_data, dict):
+-        access_token = oauth_data.get("accessToken", "")
+-        if access_token:
+-            return {
+-                "accessToken": access_token,
+-                "refreshToken": oauth_data.get("refreshToken", ""),
+-                "expiresAt": oauth_data.get("expiresAt", 0),
+-                "source": "macos_keychain",
+-            }
++        try:
++            data = json.loads(raw)
++        except json.JSONDecodeError:
++            logger.debug("Keychain: credentials payload is not valid JSON")
++            continue
++
++        oauth_data = data.get("claudeAiOauth")
++        if oauth_data and isinstance(oauth_data, dict):
++            access_token = oauth_data.get("accessToken", "")
++            if access_token:
++                return {
++                    "accessToken": access_token,
++                    "refreshToken": oauth_data.get("refreshToken", ""),
++                    "expiresAt": oauth_data.get("expiresAt", 0),
++                    "source": "macos_keychain",
++                    "claude_config_dir": str(resolved_dir),
++                }
+ 
+     return None
+ 
+ 
+-def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
+-    """Read Claude Code OAuth credentials from ~/.claude/.credentials.json.
++def _read_claude_code_credentials_from_file(
++    config_dir: Optional[Any] = None,
++) -> Optional[Dict[str, Any]]:
++    """Read Claude Code OAuth credentials from a config directory.
+ 
+     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
+     """
+-    cred_path = Path.home() / ".claude" / ".credentials.json"
++    resolved_dir = resolve_claude_config_dir(config_dir)
++    cred_path = resolved_dir / ".credentials.json"
+     if not cred_path.exists():
+         return None
+     try:
+         data = json.loads(cred_path.read_text(encoding="utf-8"))
+     except (json.JSONDecodeError, OSError, IOError) as e:
+-        logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
++        logger.debug("Failed to read %s: %s", cred_path, e)
+         return None
+ 
+     oauth_data = data.get("claudeAiOauth")
+@@ -952,15 +994,18 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
+         "refreshToken": oauth_data.get("refreshToken", ""),
+         "expiresAt": oauth_data.get("expiresAt", 0),
+         "source": "claude_code_credentials_file",
++        "claude_config_dir": str(resolved_dir),
+     }
+ 
+ 
+-def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
++def read_claude_code_credentials(
++    config_dir: Optional[Any] = None,
++) -> Optional[Dict[str, Any]]:
+     """Read refreshable Claude Code OAuth credentials.
+ 
+     Reads from two possible sources and reconciles them:
+-      1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
+-      2. ~/.claude/.credentials.json file
++      1. macOS Keychain (Darwin only) — config-scoped service entry
++      2. <CLAUDE_CONFIG_DIR>/.credentials.json file
+ 
+     Selection rules when both are present:
+       - If exactly one is non-expired, prefer that one. (Handles the case
+@@ -976,8 +1021,14 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
+ 
+     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
+     """
+-    kc_creds = _read_claude_code_credentials_from_keychain()
+-    file_creds = _read_claude_code_credentials_from_file()
++    if config_dir is None:
++        # Keep no-argument calls mock-compatible and let both readers resolve
++        # the ambient CLAUDE_CONFIG_DIR themselves.
++        kc_creds = _read_claude_code_credentials_from_keychain()
++        file_creds = _read_claude_code_credentials_from_file()
++    else:
++        kc_creds = _read_claude_code_credentials_from_keychain(config_dir)
++        file_creds = _read_claude_code_credentials_from_file(config_dir)
+ 
+     if kc_creds and file_creds:
+         kc_valid = is_claude_code_token_valid(kc_creds)
+@@ -1095,7 +1146,12 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+     # no-op, and a 0/absent ``expiresAt`` means "managed key / unknown expiry"
+     # (see is_claude_code_token_valid) which must NOT be treated as a fresh
+     # refresh here.
+-    current = read_claude_code_credentials()
++    config_dir = creds.get("claude_config_dir")
++    current = (
++        read_claude_code_credentials(config_dir)
++        if config_dir and claude_code_pool_source(config_dir) != "claude_code"
++        else read_claude_code_credentials()
++    )
+     if current:
+         current_token = current.get("accessToken", "")
+         current_exp = current.get("expiresAt", 0) or 0
+@@ -1115,11 +1171,15 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+ 
+     try:
+         refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+-        _write_claude_code_credentials(
++        write_args = (
+             refreshed["access_token"],
+             refreshed["refresh_token"],
+             refreshed["expires_at_ms"],
+         )
++        if config_dir and claude_code_pool_source(config_dir) != "claude_code":
++            _write_claude_code_credentials(*write_args, config_dir=config_dir)
++        else:
++            _write_claude_code_credentials(*write_args)
+         logger.debug("Successfully refreshed Claude Code OAuth token")
+         return refreshed["access_token"]
+     except Exception as e:
+@@ -1133,15 +1193,16 @@ def _write_claude_code_credentials(
+     expires_at_ms: int,
+     *,
+     scopes: Optional[list] = None,
++    config_dir: Optional[Any] = None,
+ ) -> None:
+-    """Write refreshed credentials back to ~/.claude/.credentials.json.
++    """Write refreshed credentials to the selected Claude config directory.
+ 
+     The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
+     is persisted so that Claude Code's own auth check recognises the credential
+     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
+     in the stored scopes before it will use the token.
+     """
+-    cred_path = Path.home() / ".claude" / ".credentials.json"
++    cred_path = resolve_claude_config_dir(config_dir) / ".credentials.json"
+     try:
+         # Read existing file to preserve other fields
+         existing = {}
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 3bd5949..b9ace24 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -125,9 +125,15 @@ _EXTRA_KEYS = frozenset({
+     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
+     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
+     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
++    "claude_config_dir",
+ })
+ 
+ 
++def _is_claude_code_source(source: Any) -> bool:
++    normalized = str(source or "").strip().lower()
++    return normalized == "claude_code" or normalized.startswith("claude_code:")
++
++
+ def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
+     """Infer pool auth metadata for token formats with one unambiguous meaning."""
+     if (
+@@ -181,6 +187,11 @@ class PooledCredential:
+ 
+     @classmethod
+     def from_dict(cls, provider: str, payload: Dict[str, Any]) -> "PooledCredential":
++        payload = dict(payload)
++        # Accept the environment-style spelling requested by existing profile
++        # files, but persist one canonical auth.json field name.
++        if "claude_config_dir" not in payload and payload.get("CLAUDE_CONFIG_DIR"):
++            payload["claude_config_dir"] = payload["CLAUDE_CONFIG_DIR"]
+         field_names = {f.name for f in fields(cls) if f.name != "provider"}
+         data = {k: payload.get(k) for k in field_names if k in payload}
+         # Rehydrated last_status_at may be an ISO string from to_dict() — normalize to float epoch
+@@ -660,11 +671,15 @@ class CredentialPool:
+         writes the new pair to ~/.claude/.credentials.json. The pool entry's
+         refresh token becomes stale. This method detects that and syncs.
+         """
+-        if self.provider != "anthropic" or entry.source != "claude_code":
++        if self.provider != "anthropic" or not _is_claude_code_source(entry.source):
+             return entry
+         try:
+             from agent.anthropic_adapter import read_claude_code_credentials
+-            creds = read_claude_code_credentials()
++            creds = (
++                read_claude_code_credentials(entry.claude_config_dir)
++                if entry.source != "claude_code" and entry.claude_config_dir
++                else read_claude_code_credentials()
++            )
+             if not creds:
+                 return entry
+             file_refresh = creds.get("refreshToken", "")
+@@ -1064,14 +1079,21 @@ class CredentialPool:
+                 # Keep ~/.claude/.credentials.json in sync so that the
+                 # fallback path (resolve_anthropic_token) and other profiles
+                 # see the latest tokens.
+-                if entry.source == "claude_code":
++                if _is_claude_code_source(entry.source):
+                     try:
+                         from agent.anthropic_adapter import _write_claude_code_credentials
+-                        _write_claude_code_credentials(
++                        write_args = (
+                             refreshed["access_token"],
+                             refreshed["refresh_token"],
+                             refreshed["expires_at_ms"],
+                         )
++                        if entry.source == "claude_code":
++                            _write_claude_code_credentials(*write_args)
++                        else:
++                            _write_claude_code_credentials(
++                                *write_args,
++                                config_dir=entry.claude_config_dir,
++                            )
+                     except Exception as wexc:
+                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
+             elif self.provider == "openai-codex":
+@@ -1126,7 +1148,7 @@ class CredentialPool:
+             # For anthropic claude_code entries: the refresh token may have been
+             # consumed by another process. Check if ~/.claude/.credentials.json
+             # has a newer token pair and retry once.
+-            if self.provider == "anthropic" and entry.source == "claude_code":
++            if self.provider == "anthropic" and _is_claude_code_source(entry.source):
+                 synced = self._sync_anthropic_entry_from_credentials_file(entry)
+                 if synced.refresh_token != entry.refresh_token:
+                     logger.debug("Retrying refresh with synced token from credentials file")
+@@ -1149,11 +1171,18 @@ class CredentialPool:
+                         self._persist()
+                         try:
+                             from agent.anthropic_adapter import _write_claude_code_credentials
+-                            _write_claude_code_credentials(
++                            write_args = (
+                                 refreshed["access_token"],
+                                 refreshed["refresh_token"],
+                                 refreshed["expires_at_ms"],
+                             )
++                            if synced.source == "claude_code":
++                                _write_claude_code_credentials(*write_args)
++                            else:
++                                _write_claude_code_credentials(
++                                    *write_args,
++                                    config_dir=synced.claude_config_dir,
++                                )
+                         except Exception as wexc:
+                             logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
+                         return updated
+@@ -1435,12 +1464,15 @@ class CredentialPool:
+             # Borrowed credentials persist as metadata-only references and are
+             # hydrated from their live source on load.  A stale duplicate row
+             # can remain unhydrated; never lease or select it as an empty key.
+-            if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
++            if not entry.runtime_api_key and (
++                entry.auth_type == AUTH_TYPE_API_KEY
++                or is_borrowed_credential_source(entry.source, entry.provider)
++            ):
+                 continue
+             # For anthropic claude_code entries, sync from the credentials file
+             # before any status/refresh checks. This picks up tokens refreshed
+             # by other processes (Claude Code CLI, other Hermes profiles).
+-            if (self.provider == "anthropic" and entry.source == "claude_code"
++            if (self.provider == "anthropic" and _is_claude_code_source(entry.source)
+                     and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
+                 synced = self._sync_anthropic_entry_from_credentials_file(entry)
+                 if synced is not entry:
+@@ -1808,6 +1840,11 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
+         "claude_code": 3,
+         "env:ANTHROPIC_API_KEY": 4,
+     }
++
++    def _source_rank(entry: PooledCredential) -> int:
++        if _is_claude_code_source(entry.source):
++            return source_rank["claude_code"]
++        return source_rank.get(entry.source, len(source_rank))
+     manual_entries = sorted(
+         (entry for entry in entries if _is_manual_source(entry.source)),
+         key=lambda entry: entry.priority,
+@@ -1815,7 +1852,7 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
+     seeded_entries = sorted(
+         (entry for entry in entries if not _is_manual_source(entry.source)),
+         key=lambda entry: (
+-            source_rank.get(entry.source, len(source_rank)),
++            _source_rank(entry),
+             entry.priority,
+             entry.label,
+         ),
+@@ -1891,36 +1928,121 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
+             # transient 401 could revive them.
+             retained = [
+                 entry for entry in entries
+-                if entry.source not in {"hermes_pkce", "claude_code"}
++                if entry.source != "hermes_pkce"
++                and not _is_claude_code_source(entry.source)
+             ]
+             if len(retained) != len(entries):
+                 entries[:] = retained
+                 changed = True
+             return changed, active_sources
+ 
+-        from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
++        from agent.anthropic_adapter import (
++            claude_code_pool_source,
++            read_claude_code_credentials,
++            read_hermes_oauth_credentials,
++            resolve_claude_config_dir,
++        )
+ 
+-        for source_name, creds in (
+-            ("hermes_pkce", read_hermes_oauth_credentials()),
+-            ("claude_code", read_claude_code_credentials()),
++        pkce_creds = read_hermes_oauth_credentials()
++        if pkce_creds and pkce_creds.get("accessToken") and not _is_suppressed(
++            provider, "hermes_pkce"
+         ):
+-            if creds and creds.get("accessToken"):
+-                if _is_suppressed(provider, source_name):
+-                    continue
+-                active_sources.add(source_name)
+-                changed |= _upsert_entry(
+-                    entries,
+-                    provider,
+-                    source_name,
+-                    {
+-                        "source": source_name,
+-                        "auth_type": AUTH_TYPE_OAUTH,
+-                        "access_token": creds.get("accessToken", ""),
+-                        "refresh_token": creds.get("refreshToken"),
+-                        "expires_at_ms": creds.get("expiresAt"),
+-                        "label": label_from_token(creds.get("accessToken", ""), source_name),
+-                    },
++            active_sources.add("hermes_pkce")
++            changed |= _upsert_entry(
++                entries,
++                provider,
++                "hermes_pkce",
++                {
++                    "source": "hermes_pkce",
++                    "auth_type": AUTH_TYPE_OAUTH,
++                    "access_token": pkce_creds.get("accessToken", ""),
++                    "refresh_token": pkce_creds.get("refreshToken"),
++                    "expires_at_ms": pkce_creds.get("expiresAt"),
++                    "label": label_from_token(
++                        pkce_creds.get("accessToken", ""), "hermes_pkce"
++                    ),
++                },
++            )
++
++        # auth.json may declare multiple Claude Code sources. Each row binds
++        # to one config directory and therefore one scoped Keychain service.
++        # Normalize source ids before upsert so ordinary source-based pool
++        # deduplication, removal and suppression remain isolated per account.
++        configured_sources: Set[str] = set()
++        for idx, entry in enumerate(list(entries)):
++            if not _is_claude_code_source(entry.source) or not entry.claude_config_dir:
++                continue
++            resolved_dir = str(resolve_claude_config_dir(entry.claude_config_dir))
++            source_name = claude_code_pool_source(resolved_dir)
++            configured_sources.add(source_name)
++            if entry.source != source_name or entry.claude_config_dir != resolved_dir:
++                entries[idx] = replace(
++                    entry,
++                    source=source_name,
++                    extra={**entry.extra, "claude_config_dir": resolved_dir},
++                )
++                entry = entries[idx]
++                changed = True
++
++            if _is_suppressed(provider, source_name):
++                continue
++            # Preserve the mapping even while that Claude account is logged
++            # out; the metadata-only row is never selectable without a token.
++            active_sources.add(source_name)
++            creds = read_claude_code_credentials(resolved_dir)
++            if not creds or not creds.get("accessToken"):
++                continue
++            changed |= _upsert_entry(
++                entries,
++                provider,
++                source_name,
++                {
++                    "source": source_name,
++                    "auth_type": AUTH_TYPE_OAUTH,
++                    "access_token": creds.get("accessToken", ""),
++                    "refresh_token": creds.get("refreshToken"),
++                    "expires_at_ms": creds.get("expiresAt"),
++                    "claude_config_dir": resolved_dir,
++                    "label": label_from_token(
++                        creds.get("accessToken", ""), source_name
++                    ),
++                },
++            )
++
++        # Backward-compatible ambient discovery: no field means the process's
++        # CLAUDE_CONFIG_DIR, otherwise ~/.claude. Skip a duplicate read when
++        # that exact directory was already declared above.
++        ambient_dir = str(resolve_claude_config_dir())
++        ambient_source = claude_code_pool_source(ambient_dir)
++        if ambient_source not in configured_sources and not _is_suppressed(
++            provider, ambient_source
++        ):
++            ambient_creds = read_claude_code_credentials()
++            if ambient_creds and ambient_creds.get("accessToken"):
++                resolved_dir = str(
++                    resolve_claude_config_dir(
++                        ambient_creds.get("claude_config_dir") or ambient_dir
++                    )
+                 )
++                source_name = claude_code_pool_source(resolved_dir)
++                if not _is_suppressed(provider, source_name):
++                    active_sources.add(source_name)
++                    changed |= _upsert_entry(
++                        entries,
++                        provider,
++                        source_name,
++                        {
++                            "source": source_name,
++                            "auth_type": AUTH_TYPE_OAUTH,
++                            "access_token": ambient_creds.get("accessToken", ""),
++                            "refresh_token": ambient_creds.get("refreshToken"),
++                            "expires_at_ms": ambient_creds.get("expiresAt"),
++                            "claude_config_dir": resolved_dir,
++                            "label": label_from_token(
++                                ambient_creds.get("accessToken", ""), source_name
++                            ),
++                        },
++                    )
+ 
+     elif provider == "nous":
+         state = _load_provider_state(auth_store, "nous")
+diff --git a/agent/credential_sources.py b/agent/credential_sources.py
+index 18f0823..78b26dd 100644
+--- a/agent/credential_sources.py
++++ b/agent/credential_sources.py
+@@ -197,9 +197,10 @@ def _remove_claude_code(provider: str, removed) -> RemovalResult:
+     We don't delete it — the user's Claude Code install still needs to
+     work.  We just suppress it so Hermes stops reading it.
+     """
++    config_dir = getattr(removed, "claude_config_dir", None) or "~/.claude"
+     return RemovalResult(hints=[
+-        "Suppressed claude_code credential — it will not be re-seeded.",
+-        "Note: Claude Code credentials still live in ~/.claude/.credentials.json",
++        f"Suppressed {removed.source} credential — it will not be re-seeded.",
++        f"Note: Claude Code credentials still live in {config_dir}",
+         "Run `hermes auth add anthropic` to re-enable if needed.",
+     ])
+ 
+@@ -398,6 +399,7 @@ def _register_all_sources() -> None:
+     ))
+     register(RemovalStep(
+         provider="anthropic", source_id="claude_code",
++        match_fn=lambda src: src == "claude_code" or src.startswith("claude_code:"),
+         remove_fn=_remove_claude_code,
+         description="~/.claude/.credentials.json",
+     ))
+diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
+index febdf53..e2b1594 100644
+--- a/tests/agent/test_anthropic_adapter.py
++++ b/tests/agent/test_anthropic_adapter.py
+@@ -229,7 +229,7 @@ class TestReadClaudeCodeCredentials:
+     def no_keychain(self, monkeypatch):
+         monkeypatch.setattr(
+             "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+-            lambda: None,
++            lambda *args, **kwargs: None,
+         )
+ 
+     def test_reads_valid_credentials(self, tmp_path, monkeypatch):
+@@ -249,6 +249,22 @@ class TestReadClaudeCodeCredentials:
+         assert creds["refreshToken"] == "sk-ant-oat01-refresh"
+         assert creds["source"] == "claude_code_credentials_file"
+ 
++    def test_reads_explicit_config_directory(self, tmp_path):
++        config_dir = tmp_path / ".claude-work"
++        config_dir.mkdir()
++        (config_dir / ".credentials.json").write_text(json.dumps({
++            "claudeAiOauth": {
++                "accessToken": "sk-ant-oat01-work",
++                "refreshToken": "work-refresh",
++                "expiresAt": int(time.time() * 1000) + 3600_000,
++            }
++        }))
++
++        creds = read_claude_code_credentials(config_dir)
++
++        assert creds["accessToken"] == "sk-ant-oat01-work"
++        assert creds["claude_config_dir"] == str(config_dir.resolve())
++
+     def test_ignores_primary_api_key_for_native_anthropic_resolution(self, tmp_path, monkeypatch):
+         claude_json = tmp_path / ".claude.json"
+         claude_json.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-primary"}))
+@@ -293,6 +309,13 @@ class TestIsClaudeCodeTokenValid:
+ 
+ 
+ class TestResolveAnthropicToken:
++    @pytest.fixture(autouse=True)
++    def no_host_keychain(self, monkeypatch):
++        monkeypatch.setattr(
++            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
++            lambda *args, **kwargs: None,
++        )
++
+     def test_prefers_oauth_token_over_api_key(self, monkeypatch, tmp_path):
+         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
+         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
+@@ -591,6 +614,20 @@ class TestWriteClaudeCodeCredentials:
+         assert data["otherField"] == "keep-me"
+         assert data["claudeAiOauth"]["accessToken"] == "new-tok"
+ 
++    def test_writes_explicit_config_directory(self, tmp_path):
++        config_dir = tmp_path / ".claude-work"
++
++        _write_claude_code_credentials(
++            "work-tok",
++            "work-ref",
++            99999,
++            config_dir=config_dir,
++        )
++
++        data = json.loads((config_dir / ".credentials.json").read_text())
++        assert data["claudeAiOauth"]["accessToken"] == "work-tok"
++        assert not (tmp_path / ".claude" / ".credentials.json").exists()
++
+     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
+     def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):
+         """Refreshed Claude Code credentials must land on disk at 0o600.
+@@ -658,6 +695,13 @@ class TestResolveWithRefresh:
+ 
+ 
+ class TestRunOauthSetupToken:
++    @pytest.fixture(autouse=True)
++    def no_host_keychain(self, monkeypatch):
++        monkeypatch.setattr(
++            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
++            lambda *args, **kwargs: None,
++        )
++
+     def test_raises_when_claude_not_installed(self, monkeypatch):
+         monkeypatch.setattr("shutil.which", lambda _: None)
+         with pytest.raises(FileNotFoundError, match="claude.*CLI.*not installed"):
+diff --git a/tests/agent/test_anthropic_keychain.py b/tests/agent/test_anthropic_keychain.py
+index 97faca0..dc3d945 100644
+--- a/tests/agent/test_anthropic_keychain.py
++++ b/tests/agent/test_anthropic_keychain.py
+@@ -6,6 +6,7 @@ from unittest.mock import patch, MagicMock
+ 
+ from agent.anthropic_adapter import (
+     _read_claude_code_credentials_from_keychain,
++    claude_code_keychain_service,
+     read_claude_code_credentials,
+     _refresh_oauth_token,
+ )
+@@ -90,6 +91,57 @@ class TestReadClaudeCodeCredentialsFromKeychain:
+             assert creds["expiresAt"] == 9999999999999
+             assert creds["source"] == "macos_keychain"
+ 
++    def test_uses_config_scoped_service_for_alternate_directory(self, tmp_path):
++        config_dir = tmp_path / ".claude-work"
++        expected_service = claude_code_keychain_service(config_dir)
++        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
++             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
++            mock_run.return_value = MagicMock(
++                returncode=0,
++                stdout=json.dumps({
++                    "claudeAiOauth": {
++                        "accessToken": "work-access",
++                        "refreshToken": "work-refresh",
++                        "expiresAt": 9999999999999,
++                    }
++                }),
++                stderr="",
++            )
++
++            creds = _read_claude_code_credentials_from_keychain(config_dir)
++
++        assert creds["accessToken"] == "work-access"
++        assert creds["claude_config_dir"] == str(config_dir.resolve())
++        command = mock_run.call_args.args[0]
++        assert command[command.index("-s") + 1] == expected_service
++        assert expected_service != "Claude Code-credentials"
++
++    def test_default_directory_falls_back_to_legacy_service(self, tmp_path, monkeypatch):
++        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
++        legacy_payload = MagicMock(
++            returncode=0,
++            stdout=json.dumps({
++                "claudeAiOauth": {
++                    "accessToken": "legacy-access",
++                    "refreshToken": "legacy-refresh",
++                    "expiresAt": 9999999999999,
++                }
++            }),
++            stderr="",
++        )
++        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
++             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
++            mock_run.side_effect = [
++                MagicMock(returncode=1, stdout="", stderr=""),
++                legacy_payload,
++            ]
++
++            creds = _read_claude_code_credentials_from_keychain()
++
++        assert creds["accessToken"] == "legacy-access"
++        assert mock_run.call_count == 2
++        assert mock_run.call_args.args[0][3] == "Claude Code-credentials"
++
+ 
+ class TestReadClaudeCodeCredentialsPriority:
+     """Bug 4: Keychain must be checked before the JSON file."""
+@@ -334,4 +386,3 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
+         assert result == "newly-minted"
+         # Prefers the live source's refresh token over the caller's stale copy.
+         assert captured["refresh_token"] == "live-refresh"
+-
+diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
+index 68a9233..185b0cc 100644
+--- a/tests/agent/test_credential_pool.py
++++ b/tests/agent/test_credential_pool.py
+@@ -1725,6 +1725,99 @@ def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path,
+     assert entry.access_token == "env-override-token"
+ 
+ 
++def test_load_pool_hydrates_multiple_claude_config_directories(tmp_path, monkeypatch):
++    """Two auth.json mappings must hydrate as two isolated Claude Code rows."""
++    hermes_home = tmp_path / "hermes"
++    first_dir = (tmp_path / ".claude-work").resolve()
++    second_dir = (tmp_path / ".claude-personal").resolve()
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
++    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
++    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
++    _write_auth_store(
++        tmp_path,
++        {
++            "version": 1,
++            "credential_pool": {
++                "anthropic": [
++                    {
++                        "id": "cc-work",
++                        "label": "work",
++                        "auth_type": "oauth",
++                        "priority": 0,
++                        "source": "claude_code",
++                        "CLAUDE_CONFIG_DIR": str(first_dir),
++                    },
++                    {
++                        "id": "cc-personal",
++                        "label": "personal",
++                        "auth_type": "oauth",
++                        "priority": 1,
++                        "source": "claude_code",
++                        "claude_config_dir": str(second_dir),
++                    },
++                ]
++            },
++        },
++    )
++    monkeypatch.setattr(
++        "hermes_cli.auth.is_provider_explicitly_configured",
++        lambda provider: provider == "anthropic",
++    )
++    monkeypatch.setattr(
++        "agent.anthropic_adapter.read_hermes_oauth_credentials",
++        lambda: None,
++    )
++
++    tokens = {
++        str(first_dir): ("work-access", "work-refresh"),
++        str(second_dir): ("personal-access", "personal-refresh"),
++    }
++
++    def _read_claude(config_dir=None):
++        if config_dir is None:
++            return None
++        access_token, refresh_token = tokens[str(config_dir)]
++        return {
++            "accessToken": access_token,
++            "refreshToken": refresh_token,
++            "expiresAt": 9_999_999_999_000,
++            "claude_config_dir": str(config_dir),
++        }
++
++    monkeypatch.setattr(
++        "agent.anthropic_adapter.read_claude_code_credentials",
++        _read_claude,
++    )
++
++    from agent.credential_pool import load_pool
++
++    entries = load_pool("anthropic").entries()
++
++    assert len(entries) == 2
++    assert {entry.runtime_api_key for entry in entries} == {
++        "work-access",
++        "personal-access",
++    }
++    assert {entry.claude_config_dir for entry in entries} == {
++        str(first_dir),
++        str(second_dir),
++    }
++    assert all(entry.source.startswith("claude_code:") for entry in entries)
++    assert len({entry.source for entry in entries}) == 2
++
++    persisted = json.loads((hermes_home / "auth.json").read_text())
++    rows = persisted["credential_pool"]["anthropic"]
++    assert all("access_token" not in row for row in rows)
++    assert all("refresh_token" not in row for row in rows)
++    assert all("CLAUDE_CONFIG_DIR" not in row for row in rows)
++    assert {row["claude_config_dir"] for row in rows} == {
++        str(first_dir),
++        str(second_dir),
++    }
++
++
+ def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch):
+     """API-key auth path: autodiscovered OAuth creds must NOT be seeded.
+ 
+diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
+index f2e65dd..fd9f106 100644
+--- a/tests/hermes_cli/test_auth_commands.py
++++ b/tests/hermes_cli/test_auth_commands.py
+@@ -1811,6 +1811,15 @@ def test_credential_sources_find_step_returns_none_for_manual():
+     assert find_removal_step("xai", "manual") is None
+ 
+ 
++def test_credential_sources_matches_scoped_claude_code_source():
++    from agent.credential_sources import find_removal_step
++
++    step = find_removal_step("anthropic", "claude_code:deadbeef")
++
++    assert step is not None
++    assert step.source_id == "claude_code"
++
++
+ def test_credential_sources_find_step_copilot_before_generic_env(tmp_path, monkeypatch):
+     """copilot env:GH_TOKEN must dispatch to the copilot step, not the
+     generic env-var step.  The copilot step handles the duplicate-source
+diff --git a/website/docs/user-guide/features/credential-pools.md b/website/docs/user-guide/features/credential-pools.md
+index 5d8503b..872d35a 100644
+--- a/website/docs/user-guide/features/credential-pools.md
++++ b/website/docs/user-guide/features/credential-pools.md
+@@ -190,6 +190,39 @@ Hermes automatically discovers credentials from multiple sources and seeds the p
+ 
+ Auto-seeded entries are updated on each pool load — if you remove an env var, its pool entry is automatically pruned. Manual entries (added via `hermes auth add`) are never auto-pruned.
+ 
++### Multiple Claude Code accounts
++
++Anthropic pool rows can bind to separate Claude Code config directories. Add one metadata-only row per account to the active profile's `auth.json` (for example `~/.hermes/profiles/<profile>/auth.json`):
++
++```json
++{
++  "credential_pool": {
++    "anthropic": [
++      {
++        "id": "cc-work",
++        "label": "Claude work",
++        "auth_type": "oauth",
++        "priority": 0,
++        "source": "claude_code",
++        "claude_config_dir": "~/.claude-work"
++      },
++      {
++        "id": "cc-personal",
++        "label": "Claude personal",
++        "auth_type": "oauth",
++        "priority": 1,
++        "source": "claude_code",
++        "CLAUDE_CONFIG_DIR": "~/.claude-personal"
++      }
++    ]
++  }
++}
++```
++
++Both `claude_config_dir` and `CLAUDE_CONFIG_DIR` are accepted on input. Hermes normalizes the field to `claude_config_dir` and assigns each non-default directory a stable `claude_code:<hash>` source id. On macOS it reads Claude Code's directory-scoped Keychain service; elsewhere it reads `<claude_config_dir>/.credentials.json`. Access and refresh tokens remain borrowed from Claude Code and are not copied into `auth.json`.
++
++The process-level `CLAUDE_CONFIG_DIR` remains the backward-compatible single-account default. Explicit pool rows are what enable several Claude Code accounts in one Hermes profile and one rotation pool.
++
+ Borrowed runtime secrets (for example env vars, Bitwarden/Vault/keyring/systemd references, and custom config values) are reference-only at the `auth.json` boundary. Hermes can use the resolved value in memory for the current run, but it persists only metadata such as the source ref, label, status, request counters, and a non-reversible fingerprint. Manual entries and Hermes-owned OAuth/device-code state keep the durable tokens they need to refresh.
+ 
+ ## Delegation & Subagent Sharing
