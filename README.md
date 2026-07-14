@@ -1,7 +1,7 @@
 # Hermes multi-Claude Code auth patch
 
 Small downstream patch adding multiple `CLAUDE_CONFIG_DIR` accounts to one
-Hermes Anthropic credential pool.
+Hermes Anthropic credential pool and an opt-in official Claude Code CLI runtime.
 
 Supported base:
 
@@ -17,6 +17,8 @@ Supported base:
 - Refresh/sync written back only to the matching Claude config directory.
 - Metadata and fingerprints in Hermes `auth.json`; no copied OAuth tokens.
 - Backward-compatible default `~/.claude` behavior.
+- Inference through official `claude -p`, using the selected entry's directory.
+- Automatic rotation to another configured directory on auth/rate-limit errors.
 
 Non-default source ids become `claude_code:<8-char-directory-hash>`. The
 default directory keeps `source: "claude_code"`.
@@ -38,7 +40,7 @@ git apply --3way "$PATCH"
 Patch SHA-256:
 
 ```text
-f24e9bb3b0d7e8266b25ad1c92924adff82e182c058dfb7783ace7f8935b9070
+3f9c16faa06235afd8a87e62d01e0a1fd08912e4ed70b37321c62d15749009d8
 ```
 
 ## Configure one Hermes profile
@@ -51,11 +53,11 @@ Add metadata-only rows to that profile's `auth.json`:
     "anthropic": [
       {
         "id": "cc-work",
-        "label": "claude-work",
+        "label": "claude-team",
         "auth_type": "oauth",
         "priority": 0,
         "source": "claude_code",
-        "claude_config_dir": "~/.claude-work"
+        "claude_config_dir": "~/.claude-team"
       },
       {
         "id": "cc-personal",
@@ -73,6 +75,18 @@ Add metadata-only rows to that profile's `auth.json`:
 Each directory must already be authenticated with Claude Code. Hermes reads
 its matching Keychain/file credentials on pool load.
 
+Enable the official CLI adapter only in the selected profile's `config.yaml`:
+
+```yaml
+model:
+  provider: anthropic
+  anthropic_runtime: claude_code_cli
+```
+
+Without `anthropic_runtime`, Hermes keeps its normal direct Anthropic runtime.
+With it, each turn runs through the official Claude Code CLI and the active
+pool entry's `CLAUDE_CONFIG_DIR`.
+
 To exclude implicit `~/.claude` discovery while retaining scoped rows:
 
 ```json
@@ -87,11 +101,19 @@ To exclude implicit `~/.claude` discovery while retaining scoped rows:
 
 ```bash
 cd ~/.hermes/hermes-agent
-scripts/run_tests.sh \
+venv/bin/pytest -q \
+  tests/agent/test_claude_code_cli_client.py \
+  tests/agent/test_credential_pool_routing.py \
+  tests/agent/test_credential_pool.py
+
+venv/bin/pytest -q \
+  tests/hermes_cli/test_runtime_provider_resolution.py \
+  tests/run_agent/test_run_agent.py
+
+venv/bin/pytest -q \
   tests/agent/test_anthropic_keychain.py \
   tests/agent/test_anthropic_adapter.py \
-  tests/agent/test_credential_pool.py \
-  tests/hermes_cli/test_auth_commands.py -q
+  tests/hermes_cli/test_auth_commands.py
 
 HERMES_HOME=~/.hermes/profiles/YOUR_PROFILE hermes auth list anthropic
 ```
@@ -100,7 +122,7 @@ Expected shape:
 
 ```text
 anthropic (2 credentials):
-  #1  claude-work      oauth  claude_code:xxxxxxxx
+  #1  claude-team      oauth  claude_code:xxxxxxxx
   #2  claude-personal  oauth  claude_code:yyyyyyyy
 ```
 
@@ -124,10 +146,14 @@ retire the downstream patch.
 
 ## Test result
 
-`337` focused Hermes tests passed on the supported base. A real four-account
-profile check hydrated four distinct Claude Code credentials: three completed
-live `claude-opus-4-8` requests, while one correctly returned HTTP 429 and the
-pool selected the next healthy account.
+`675` adapter/routing/runtime tests passed on the supported base. A live test
+proved the new path end-to-end: the default Claude directory returned HTTP 401,
+Hermes rotated automatically, and the next configured directory returned the
+expected `OK` response through official `claude -p`.
+
+Current adapter is deliberately small: response streaming is buffered until
+the CLI turn completes, and Claude Code supplies its own tools rather than
+Hermes forwarding tool schemas into the subprocess.
 
 ## License
 

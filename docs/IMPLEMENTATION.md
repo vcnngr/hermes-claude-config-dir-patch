@@ -10,6 +10,8 @@ Unpatched Hermes reads one ambient Claude Code identity:
 
 That cannot represent several Claude Code logins inside one Hermes profile.
 Changing a profile `.env` selects only one directory for the whole process.
+Directly replaying borrowed OAuth tokens also does not reproduce Claude Code's
+supported inference path.
 
 ## Design
 
@@ -23,6 +25,25 @@ auth.json row
   -> derive macOS Keychain service
   -> hydrate borrowed token in memory
   -> select/rotate through normal Anthropic pool
+```
+
+The optional profile setting below switches inference to the official CLI:
+
+```yaml
+model:
+  anthropic_runtime: claude_code_cli
+```
+
+Runtime flow:
+
+```text
+selected pool entry
+  -> pass its claude_config_dir to ClaudeCodeCLIClient
+  -> strip ambient Anthropic token variables
+  -> set child CLAUDE_CONFIG_DIR
+  -> run official claude -p with JSON output
+  -> map result/usage into Hermes' chat-completion interface
+  -> rotate pool entry on 401/429
 ```
 
 For `/Users/example/.claude-work`:
@@ -64,4 +85,9 @@ default-directory discovery; scoped rows remain available.
 - `agent/credential_pool.py`: schema alias, scoped hydration, source ranking,
   refresh/resync isolation.
 - `agent/credential_sources.py`: removal matching for scoped source ids.
+- `agent/claude_code_cli_client.py`: small OpenAI-compatible facade over
+  official `claude -p`.
+- `hermes_cli/runtime_provider.py`: profile opt-in runtime selection.
+- `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `run_agent.py`:
+  selected-directory propagation and credential rotation.
 - Focused tests and credential-pool docs.

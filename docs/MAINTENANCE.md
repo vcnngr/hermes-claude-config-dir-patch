@@ -56,15 +56,25 @@ VERSION=vX.Y.Z
 OUT=~/Documents/claude/hermes-claude-config-dir-patch/patches/$VERSION
 mkdir -p "$OUT"
 
+git add -N agent/claude_code_cli_client.py tests/agent/test_claude_code_cli_client.py
 git diff --binary --output="$OUT/hermes-claude-config-dir-multipool.patch" -- \
+  agent/agent_init.py \
+  agent/agent_runtime_helpers.py \
   agent/anthropic_adapter.py \
+  agent/claude_code_cli_client.py \
   agent/credential_pool.py \
   agent/credential_sources.py \
+  hermes_cli/runtime_provider.py \
+  run_agent.py \
   tests/agent/test_anthropic_adapter.py \
   tests/agent/test_anthropic_keychain.py \
+  tests/agent/test_claude_code_cli_client.py \
   tests/agent/test_credential_pool.py \
+  tests/agent/test_credential_pool_routing.py \
   tests/hermes_cli/test_auth_commands.py \
+  tests/run_agent/test_run_agent.py \
   website/docs/user-guide/features/credential-pools.md
+git restore --staged agent/claude_code_cli_client.py tests/agent/test_claude_code_cli_client.py
 
 git apply --check --reverse "$OUT/hermes-claude-config-dir-multipool.patch"
 shasum -a 256 "$OUT/hermes-claude-config-dir-multipool.patch"

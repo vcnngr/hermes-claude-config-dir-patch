@@ -1,3 +1,87 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index c5826b4..b180aec 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -938,6 +938,17 @@ def init_agent(
+                 }
+             else:
+                 client_kwargs = {"api_key": api_key, "base_url": base_url}
++            if str(base_url or "").startswith("acp://claude-code"):
++                active_entry = None
++                pool_entries = credential_pool.entries() if credential_pool is not None else []
++                for candidate in pool_entries:
++                    candidate_key = getattr(candidate, "runtime_api_key", None) or getattr(candidate, "access_token", "")
++                    if candidate_key == api_key:
++                        active_entry = candidate
++                        break
++                config_dir = getattr(active_entry, "claude_config_dir", None) if active_entry is not None else None
++                if config_dir:
++                    client_kwargs["claude_config_dir"] = config_dir
+             if _provider_timeout is not None:
+                 client_kwargs["timeout"] = _provider_timeout
+             if agent.provider == "copilot-acp":
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 1cde734..0dd291e 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -704,8 +704,8 @@ def recover_with_credential_pool(
+     """Attempt credential recovery via pool rotation.
+ 
+     Returns (recovered, has_retried_429).
+-    On rate limits: first occurrence retries same credential (sets flag True).
+-                    second consecutive failure rotates to next credential.
++    On rate limits: immediately rotates when another usable credential exists.
++                    Otherwise the first occurrence retries the same credential.
+     On billing exhaustion: immediately rotates.
+     On auth failures: attempts token refresh before rotating.
+ 
+@@ -841,7 +841,18 @@ def recover_with_credential_pool(
+                 or "usage limit has been reached" in context_message
+             )
+         if not has_retried_429 and not usage_limit_reached:
+-            return False, True
++            has_alternative_fn = getattr(pool, "has_available_alternative", None)
++            has_alternative = (
++                has_alternative_fn()
++                if callable(has_alternative_fn)
++                else False
++            )
++            if has_alternative is not True:
++                return False, True
++            _ra().logger.info(
++                "Rate-limited credential has an available pool alternative — "
++                "rotating immediately instead of waiting for Retry-After"
++            )
+         rotate_status = status_code if status_code is not None else 429
+         next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+         if next_entry is not None:
+@@ -855,6 +866,15 @@ def recover_with_credential_pool(
+         return False, True
+ 
+     if effective_reason == FailoverReason.auth:
++        if str(getattr(agent, "base_url", "") or "").startswith("acp://claude-code"):
++            next_entry = pool.mark_exhausted_and_rotate(
++                status_code=status_code or 401,
++                error_context=error_context,
++            )
++            if next_entry is not None:
++                agent._swap_credential(next_entry)
++                return True, False
++            return False, has_retried_429
+         # Subscription/entitlement 403s look like auth failures on the wire
+         # but refresh cannot fix them — the OAuth token is already valid,
+         # the account simply lacks the entitlement.  Without this guard,
+@@ -1702,6 +1722,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
+             agent._client_log_context(),
+         )
+         return client
++    if str(client_kwargs.get("base_url", "")).startswith("acp://claude-code"):
++        from agent.claude_code_cli_client import ClaudeCodeCLIClient
++
++        return ClaudeCodeCLIClient(**client_kwargs)
+     if agent.provider == "gemini":
+         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+ 
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
 index 689d010..e5ddb25 100644
 --- a/agent/anthropic_adapter.py
@@ -258,8 +342,228 @@ index 689d010..e5ddb25 100644
      try:
          # Read existing file to preserve other fields
          existing = {}
+diff --git a/agent/claude_code_cli_client.py b/agent/claude_code_cli_client.py
+new file mode 100644
+index 0000000..fd778c5
+--- /dev/null
++++ b/agent/claude_code_cli_client.py
+@@ -0,0 +1,214 @@
++"""OpenAI-compatible facade backed by the official ``claude -p`` CLI."""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++from agent.copilot_acp_client import _completion_to_stream_chunks
++from tools.environments.local import hermes_subprocess_env
++
++
++CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
++_DEFAULT_TIMEOUT_SECONDS = 900.0
++
++
++class ClaudeCodeCLIError(RuntimeError):
++    def __init__(self, message: str, *, status_code: int = 500):
++        super().__init__(message)
++        self.status_code = status_code
++
++
++def _render_content(content: Any) -> str:
++    if isinstance(content, str):
++        return content.strip()
++    if isinstance(content, list):
++        parts = []
++        for item in content:
++            if isinstance(item, str):
++                parts.append(item)
++            elif isinstance(item, dict) and isinstance(item.get("text"), str):
++                parts.append(item["text"])
++        return "\n".join(parts).strip()
++    if content is None:
++        return ""
++    return json.dumps(content, ensure_ascii=False)
++
++
++def _format_prompt(messages: list[dict[str, Any]]) -> str:
++    transcript = []
++    for message in messages:
++        if not isinstance(message, dict):
++            continue
++        text = _render_content(message.get("content"))
++        if text:
++            transcript.append(f"{str(message.get('role') or 'context').upper()}:\n{text}")
++    return (
++        "Continue this Hermes conversation. Follow system instructions and answer the latest user.\n\n"
++        + "\n\n".join(transcript)
++    )
++
++
++def _status_for_error(text: str) -> int:
++    lower = text.lower()
++    if any(term in lower for term in ("rate limit", "usage limit", "hit your limit", "limit reached", "resets at")):
++        return 429
++    if any(term in lower for term in ("not logged in", "authentication", "unauthorized", "invalid token")):
++        return 401
++    return 500
++
++
++class _ChatCompletions:
++    def __init__(self, client: "ClaudeCodeCLIClient"):
++        self._client = client
++
++    def create(self, **kwargs: Any) -> Any:
++        return self._client._create_chat_completion(**kwargs)
++
++
++class _Chat:
++    def __init__(self, client: "ClaudeCodeCLIClient"):
++        self.completions = _ChatCompletions(client)
++
++
++class ClaudeCodeCLIClient:
++    """Run each Hermes model turn through official Claude Code."""
++
++    def __init__(
++        self,
++        *,
++        api_key: str | None = None,
++        base_url: str | None = None,
++        claude_config_dir: str | None = None,
++        timeout: Any = None,
++        **_: Any,
++    ):
++        self.api_key = api_key or "claude-code-cli"
++        self.base_url = base_url or CLAUDE_CODE_MARKER_BASE_URL
++        self.claude_config_dir = str(Path(claude_config_dir or "~/.claude").expanduser().resolve())
++        self.timeout = timeout
++        self.chat = _Chat(self)
++        self.is_closed = False
++        self._active_process: subprocess.Popen[str] | None = None
++        self._lock = threading.Lock()
++
++    def close(self) -> None:
++        with self._lock:
++            proc = self._active_process
++            self._active_process = None
++        self.is_closed = True
++        if proc and proc.poll() is None:
++            proc.terminate()
++
++    def _subprocess_env(self) -> dict[str, str]:
++        env = hermes_subprocess_env(inherit_credentials=True)
++        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDECODE"):
++            env.pop(key, None)
++        env["CLAUDE_CONFIG_DIR"] = self.claude_config_dir
++        env.setdefault("HOME", os.path.expanduser("~"))
++        return env
++
++    def _effective_timeout(self, timeout: Any) -> float:
++        value = timeout if timeout is not None else self.timeout
++        if isinstance(value, (int, float)) and value > 0:
++            return float(value)
++        candidates = [getattr(value, key, None) for key in ("read", "write", "connect", "pool")]
++        numeric = [float(item) for item in candidates if isinstance(item, (int, float)) and item > 0]
++        return max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
++
++    def _run(self, prompt: str, *, model: str, timeout: float) -> dict[str, Any]:
++        command = shutil.which("claude")
++        if not command:
++            raise ClaudeCodeCLIError("Claude Code CLI not found", status_code=503)
++        args = [
++            command,
++            "-p",
++            prompt,
++            "--model",
++            model,
++            "--output-format",
++            "json",
++            "--no-session-persistence",
++        ]
++        proc = subprocess.Popen(
++            args,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            cwd=os.getcwd(),
++            env=self._subprocess_env(),
++        )
++        self.is_closed = False
++        with self._lock:
++            self._active_process = proc
++        try:
++            stdout, stderr = proc.communicate(timeout=timeout)
++        except subprocess.TimeoutExpired as exc:
++            proc.kill()
++            proc.communicate()
++            raise ClaudeCodeCLIError("Claude Code CLI timed out", status_code=504) from exc
++        finally:
++            with self._lock:
++                if self._active_process is proc:
++                    self._active_process = None
++
++        payload = None
++        for line in reversed(stdout.splitlines()):
++            try:
++                candidate = json.loads(line)
++            except Exception:
++                continue
++            if isinstance(candidate, dict):
++                payload = candidate
++                break
++        if payload is None:
++            message = (stderr or stdout or "Claude Code CLI returned no JSON").strip()
++            raise ClaudeCodeCLIError(message[:1000], status_code=_status_for_error(message))
++        if proc.returncode != 0 or payload.get("is_error"):
++            message = str(payload.get("result") or stderr or "Claude Code CLI failed")
++            raise ClaudeCodeCLIError(message[:1000], status_code=int(payload.get("api_error_status") or _status_for_error(message)))
++        return payload
++
++    def _create_chat_completion(
++        self,
++        *,
++        model: str | None = None,
++        messages: list[dict[str, Any]] | None = None,
++        timeout: Any = None,
++        stream: bool = False,
++        **_: Any,
++    ) -> Any:
++        selected_model = model or "claude-sonnet-4-6"
++        payload = self._run(
++            _format_prompt(messages or []),
++            model=selected_model,
++            timeout=self._effective_timeout(timeout),
++        )
++        usage_data = payload.get("usage") or {}
++        prompt_tokens = int(usage_data.get("input_tokens") or 0)
++        completion_tokens = int(usage_data.get("output_tokens") or 0)
++        usage = SimpleNamespace(
++            prompt_tokens=prompt_tokens,
++            completion_tokens=completion_tokens,
++            total_tokens=prompt_tokens + completion_tokens,
++            prompt_tokens_details=SimpleNamespace(cached_tokens=int(usage_data.get("cache_read_input_tokens") or 0)),
++        )
++        message = SimpleNamespace(
++            content=str(payload.get("result") or ""),
++            tool_calls=None,
++            reasoning=None,
++            reasoning_content=None,
++            reasoning_details=None,
++        )
++        completion = SimpleNamespace(
++            choices=[SimpleNamespace(message=message, finish_reason="stop")],
++            usage=usage,
++            model=selected_model,
++        )
++        return _completion_to_stream_chunks(completion) if stream else completion
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
-index 3bd5949..c5b8bd4 100644
+index 3bd5949..b25158b 100644
 --- a/agent/credential_pool.py
 +++ b/agent/credential_pool.py
 @@ -125,9 +125,15 @@ _EXTRA_KEYS = frozenset({
@@ -290,7 +594,22 @@ index 3bd5949..c5b8bd4 100644
          field_names = {f.name for f in fields(cls) if f.name != "provider"}
          data = {k: payload.get(k) for k in field_names if k in payload}
          # Rehydrated last_status_at may be an ISO string from to_dict() — normalize to float epoch
-@@ -660,11 +671,15 @@ class CredentialPool:
+@@ -576,6 +587,14 @@ class CredentialPool:
+         """True if at least one entry is not currently in exhaustion cooldown."""
+         return bool(self._available_entries())
+ 
++    def has_available_alternative(self) -> bool:
++        """True if selection can move to another currently usable entry."""
++        available = self._available_entries()
++        current = self.current()
++        if current is None:
++            return len(available) > 1
++        return any(entry.id != current.id for entry in available)
++
+     def entries(self) -> List[PooledCredential]:
+         return list(self._entries)
+ 
+@@ -660,11 +679,15 @@ class CredentialPool:
          writes the new pair to ~/.claude/.credentials.json. The pool entry's
          refresh token becomes stale. This method detects that and syncs.
          """
@@ -308,7 +627,7 @@ index 3bd5949..c5b8bd4 100644
              if not creds:
                  return entry
              file_refresh = creds.get("refreshToken", "")
-@@ -1064,14 +1079,21 @@ class CredentialPool:
+@@ -1064,14 +1087,21 @@ class CredentialPool:
                  # Keep ~/.claude/.credentials.json in sync so that the
                  # fallback path (resolve_anthropic_token) and other profiles
                  # see the latest tokens.
@@ -332,7 +651,7 @@ index 3bd5949..c5b8bd4 100644
                      except Exception as wexc:
                          logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
              elif self.provider == "openai-codex":
-@@ -1126,7 +1148,7 @@ class CredentialPool:
+@@ -1126,7 +1156,7 @@ class CredentialPool:
              # For anthropic claude_code entries: the refresh token may have been
              # consumed by another process. Check if ~/.claude/.credentials.json
              # has a newer token pair and retry once.
@@ -341,7 +660,7 @@ index 3bd5949..c5b8bd4 100644
                  synced = self._sync_anthropic_entry_from_credentials_file(entry)
                  if synced.refresh_token != entry.refresh_token:
                      logger.debug("Retrying refresh with synced token from credentials file")
-@@ -1149,11 +1171,18 @@ class CredentialPool:
+@@ -1149,11 +1179,18 @@ class CredentialPool:
                          self._persist()
                          try:
                              from agent.anthropic_adapter import _write_claude_code_credentials
@@ -361,7 +680,7 @@ index 3bd5949..c5b8bd4 100644
                          except Exception as wexc:
                              logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
                          return updated
-@@ -1435,12 +1464,15 @@ class CredentialPool:
+@@ -1435,12 +1472,15 @@ class CredentialPool:
              # Borrowed credentials persist as metadata-only references and are
              # hydrated from their live source on load.  A stale duplicate row
              # can remain unhydrated; never lease or select it as an empty key.
@@ -379,7 +698,7 @@ index 3bd5949..c5b8bd4 100644
                      and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
                  synced = self._sync_anthropic_entry_from_credentials_file(entry)
                  if synced is not entry:
-@@ -1808,6 +1840,11 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
+@@ -1808,6 +1848,11 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
          "claude_code": 3,
          "env:ANTHROPIC_API_KEY": 4,
      }
@@ -391,7 +710,7 @@ index 3bd5949..c5b8bd4 100644
      manual_entries = sorted(
          (entry for entry in entries if _is_manual_source(entry.source)),
          key=lambda entry: entry.priority,
-@@ -1815,7 +1852,7 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
+@@ -1815,7 +1860,7 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
      seeded_entries = sorted(
          (entry for entry in entries if not _is_manual_source(entry.source)),
          key=lambda entry: (
@@ -400,7 +719,7 @@ index 3bd5949..c5b8bd4 100644
              entry.priority,
              entry.label,
          ),
-@@ -1891,36 +1928,129 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
+@@ -1891,36 +1936,129 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
              # transient 401 could revive them.
              retained = [
                  entry for entry in entries
@@ -576,6 +895,43 @@ index 18f0823..78b26dd 100644
          remove_fn=_remove_claude_code,
          description="~/.claude/.credentials.json",
      ))
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index a3a26b2..b6488ba 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -433,14 +433,15 @@ def _resolve_runtime_from_pool_entry(
+         pconfig = PROVIDER_REGISTRY.get(provider)
+         base_url = base_url or (pconfig.inference_base_url if pconfig else "")
+     elif provider == "anthropic":
+-        api_mode = "anthropic_messages"
++        use_claude_cli = str(model_cfg.get("anthropic_runtime") or "").strip().lower() == "claude_code_cli"
++        api_mode = "chat_completions" if use_claude_cli else "anthropic_messages"
+         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+         cfg_base_url = ""
+         if cfg_provider == "anthropic":
+             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+             if not _anthropic_base_url_override_ok(cfg_base_url):
+                 cfg_base_url = ""
+-        base_url = cfg_base_url or base_url or "https://api.anthropic.com"
++        base_url = "acp://claude-code" if use_claude_cli else (cfg_base_url or base_url or "https://api.anthropic.com")
+     elif provider == "openrouter":
+         base_url = base_url or OPENROUTER_BASE_URL
+     elif provider == "xai":
+diff --git a/run_agent.py b/run_agent.py
+index fe378f3..daadf5e 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -4540,6 +4540,10 @@ class AIAgent:
+         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+         self._client_kwargs["api_key"] = self.api_key
+         self._client_kwargs["base_url"] = self.base_url
++        if str(self.base_url or "").startswith("acp://claude-code"):
++            config_dir = getattr(entry, "claude_config_dir", None)
++            if config_dir:
++                self._client_kwargs["claude_config_dir"] = config_dir
+         self._apply_client_headers_for_base_url(self.base_url)
+         self._replace_primary_openai_client(reason="credential_rotation")
+ 
 diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
 index febdf53..e2b1594 100644
 --- a/tests/agent/test_anthropic_adapter.py
@@ -736,6 +1092,80 @@ index 97faca0..dc3d945 100644
          # Prefers the live source's refresh token over the caller's stale copy.
          assert captured["refresh_token"] == "live-refresh"
 -
+diff --git a/tests/agent/test_claude_code_cli_client.py b/tests/agent/test_claude_code_cli_client.py
+new file mode 100644
+index 0000000..359022d
+--- /dev/null
++++ b/tests/agent/test_claude_code_cli_client.py
+@@ -0,0 +1,68 @@
++import json
++
++import pytest
++
++from agent.claude_code_cli_client import (
++    CLAUDE_CODE_MARKER_BASE_URL,
++    ClaudeCodeCLIClient,
++    ClaudeCodeCLIError,
++)
++
++
++class _FakeProcess:
++    def __init__(self, stdout: str, returncode: int = 0):
++        self._stdout = stdout
++        self.returncode = returncode
++
++    def communicate(self, timeout=None):
++        return self._stdout, ""
++
++    def poll(self):
++        return self.returncode
++
++    def terminate(self):
++        self.returncode = -15
++
++
++def test_cli_client_uses_config_dir_and_strips_direct_auth(monkeypatch, tmp_path):
++    captured = {}
++    payload = {"is_error": False, "result": "OK", "usage": {"input_tokens": 2, "output_tokens": 1}}
++
++    def fake_popen(args, **kwargs):
++        captured.update(args=args, **kwargs)
++        return _FakeProcess(json.dumps(payload))
++
++    monkeypatch.setattr("agent.claude_code_cli_client.shutil.which", lambda _: "/usr/bin/claude")
++    monkeypatch.setattr("agent.claude_code_cli_client.subprocess.Popen", fake_popen)
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-pass")
++
++    client = ClaudeCodeCLIClient(
++        base_url=CLAUDE_CODE_MARKER_BASE_URL,
++        claude_config_dir=str(tmp_path),
++    )
++    response = client.chat.completions.create(
++        model="claude-opus-4-8",
++        messages=[{"role": "user", "content": "OK"}],
++    )
++
++    assert response.choices[0].message.content == "OK"
++    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path.resolve())
++    assert "ANTHROPIC_API_KEY" not in captured["env"]
++
++
++def test_cli_client_maps_usage_limit_to_429(monkeypatch, tmp_path):
++    payload = {"is_error": True, "result": "You've hit your usage limit", "api_error_status": 429}
++    monkeypatch.setattr("agent.claude_code_cli_client.shutil.which", lambda _: "/usr/bin/claude")
++    monkeypatch.setattr(
++        "agent.claude_code_cli_client.subprocess.Popen",
++        lambda *args, **kwargs: _FakeProcess(json.dumps(payload), returncode=1),
++    )
++    client = ClaudeCodeCLIClient(claude_config_dir=str(tmp_path))
++
++    with pytest.raises(ClaudeCodeCLIError) as exc:
++        client.chat.completions.create(
++            model="claude-opus-4-8",
++            messages=[{"role": "user", "content": "hello"}],
++        )
++
++    assert exc.value.status_code == 429
 diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
 index 68a9233..c2d2ec6 100644
 --- a/tests/agent/test_credential_pool.py
@@ -867,6 +1297,62 @@ index 68a9233..c2d2ec6 100644
  def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch):
      """API-key auth path: autodiscovered OAuth creds must NOT be seeded.
  
+diff --git a/tests/agent/test_credential_pool_routing.py b/tests/agent/test_credential_pool_routing.py
+index 9c7c047..d1c99d9 100644
+--- a/tests/agent/test_credential_pool_routing.py
++++ b/tests/agent/test_credential_pool_routing.py
+@@ -5,7 +5,7 @@ Covers:
+ 2. Gateway _resolve_turn_agent_config passes credential_pool to runtime dict
+ 3. Eager fallback deferred when credential pool has credentials
+ 4. Eager fallback fires when no credential pool exists
+-5. Full 429 rotation cycle: retry-same → rotate → exhaust → fallback
++5. Full 429 rotation cycle: immediate alternative → exhaust → fallback
+ """
+ 
+ from types import SimpleNamespace
+@@ -139,7 +139,7 @@ class TestEagerFallbackWithPool:
+ # ---------------------------------------------------------------------------
+ 
+ class TestPoolRotationCycle:
+-    """Verify the retry-same → rotate → exhaust flow in _recover_with_credential_pool."""
++    """Verify immediate alternative rotation and single-entry retry behavior."""
+ 
+     def _make_agent_with_pool(self, pool_entries=3):
+         from run_agent import AIAgent
+@@ -155,6 +155,8 @@ class TestPoolRotationCycle:
+ 
+         pool = MagicMock()
+         pool.has_credentials.return_value = True
++        pool.current.return_value = entries[0]
++        pool.has_available_alternative.return_value = pool_entries > 1
+         # Must be set explicitly — MagicMock.provider returns a truthy
+         # child mock, which would trigger the provider-mismatch guard.
+         pool.provider = ""
+@@ -176,15 +178,18 @@ class TestPoolRotationCycle:
+ 
+         return agent, pool, entries
+ 
+-    def test_first_429_sets_retry_flag_no_rotation(self):
+-        """First 429 should just set has_retried_429=True, no rotation."""
+-        agent, pool, _ = self._make_agent_with_pool(3)
++    def test_first_429_rotates_when_alternative_is_available(self):
++        """First 429 should rotate without honoring a long Retry-After."""
++        agent, pool, entries = self._make_agent_with_pool(3)
+         recovered, has_retried = agent._recover_with_credential_pool(
+             status_code=429, has_retried_429=False
+         )
+-        assert recovered is False
+-        assert has_retried is True
+-        pool.mark_exhausted_and_rotate.assert_not_called()
++        assert recovered is True
++        assert has_retried is False
++        pool.mark_exhausted_and_rotate.assert_called_once_with(
++            status_code=429, error_context=None
++        )
++        agent._swap_credential.assert_called_once_with(entries[1])
+ 
+     def test_second_429_rotates_to_next(self):
+         """Second consecutive 429 should rotate to next credential."""
 diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
 index f2e65dd..fd9f106 100644
 --- a/tests/hermes_cli/test_auth_commands.py
@@ -887,6 +1373,137 @@ index f2e65dd..fd9f106 100644
  def test_credential_sources_find_step_copilot_before_generic_env(tmp_path, monkeypatch):
      """copilot env:GH_TOKEN must dispatch to the copilot step, not the
      generic env-var step.  The copilot step handles the duplicate-source
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index afb45a5..3d6ebf7 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -2497,6 +2497,71 @@ class TestRetryAfterCap:
+         status = self._drive_once(agent, 900)
+         assert "Waiting 600.0s" in status
+ 
++    def test_multi_pool_rotates_before_retry_after_sleep(self, agent):
++        """A usable alternative must win over a long per-credential wait."""
++        from agent.credential_pool import (
++            CredentialPool,
++            PooledCredential,
++            STATUS_EXHAUSTED,
++        )
++
++        class _RateLimitError(Exception):
++            status_code = 429
++            response = SimpleNamespace(headers={"retry-after": "900"})
++
++            def __str__(self):
++                return "Error code: 429 - Rate limit exceeded."
++
++        provider = "anthropic"
++        agent.provider = provider
++        agent.base_url = "https://api.anthropic.com"
++        entries = [
++            PooledCredential(
++                provider=provider,
++                id="primary",
++                label="primary",
++                auth_type="api_key",
++                priority=0,
++                source="manual:primary",
++                access_token="key-primary",
++            ),
++            PooledCredential(
++                provider=provider,
++                id="secondary",
++                label="secondary",
++                auth_type="api_key",
++                priority=1,
++                source="manual:secondary",
++                access_token="key-secondary",
++            ),
++        ]
++        pool = CredentialPool(provider, entries)
++        assert pool.select().id == "primary"
++        agent._credential_pool = pool
++        agent._swap_credential = MagicMock()
++        agent._persist_session = lambda *args, **kwargs: None
++        agent._save_trajectory = lambda *args, **kwargs: None
++
++        responses = [_RateLimitError(), _mock_response(content="Recovered")]
++
++        def _fake_api_call(api_kwargs):
++            result = responses.pop(0)
++            if isinstance(result, Exception):
++                raise result
++            return result
++
++        agent._interruptible_api_call = _fake_api_call
++
++        with patch("run_agent.time.sleep") as mocked_sleep:
++            result = agent.run_conversation("hello")
++
++        assert result["completed"] is True
++        assert result["final_response"] == "Recovered"
++        mocked_sleep.assert_not_called()
++        agent._swap_credential.assert_called_once()
++        assert agent._swap_credential.call_args.args[0].id == "secondary"
++        assert pool.entries()[0].last_status == STATUS_EXHAUSTED
++
+ 
+ class TestConcurrentToolExecution:
+     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
+@@ -5961,13 +6026,16 @@ class TestCredentialPoolRecovery:
+         assert retry_same is False
+         agent._swap_credential.assert_called_once_with(next_entry)
+ 
+-    def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
++    def test_recover_with_pool_rotates_first_429_when_alternative_exists(self, agent):
+         next_entry = SimpleNamespace(label="secondary")
+ 
+         class _Pool:
+             def current(self):
+                 return SimpleNamespace(label="primary")
+ 
++            def has_available_alternative(self):
++                return True
++
+             def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                 assert status_code == 429
+                 assert error_context is None
+@@ -5980,17 +6048,29 @@ class TestCredentialPoolRecovery:
+             status_code=429,
+             has_retried_429=False,
+         )
+-        assert recovered is False
+-        assert retry_same is True
+-        agent._swap_credential.assert_not_called()
++        assert recovered is True
++        assert retry_same is False
++        agent._swap_credential.assert_called_once_with(next_entry)
++
++    def test_recover_with_single_pool_retries_first_429(self, agent):
++        class _Pool:
++            def current(self):
++                return SimpleNamespace(label="primary")
++
++            def has_available_alternative(self):
++                return False
++
++        agent._credential_pool = _Pool()
++        agent._swap_credential = MagicMock()
+ 
+         recovered, retry_same = agent._recover_with_credential_pool(
+             status_code=429,
+-            has_retried_429=True,
++            has_retried_429=False,
+         )
+-        assert recovered is True
+-        assert retry_same is False
+-        agent._swap_credential.assert_called_once_with(next_entry)
++
++        assert recovered is False
++        assert retry_same is True
++        agent._swap_credential.assert_not_called()
+ 
+ 
+     def test_recover_with_pool_refreshes_on_401(self, agent):
 diff --git a/website/docs/user-guide/features/credential-pools.md b/website/docs/user-guide/features/credential-pools.md
 index 5d8503b..872d35a 100644
 --- a/website/docs/user-guide/features/credential-pools.md

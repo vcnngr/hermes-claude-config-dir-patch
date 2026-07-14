@@ -2,18 +2,31 @@
 
 ## Automated regression suite
 
-Always use Hermes' test runner:
+Current adapter/runtime regression commands:
 
 ```bash
 cd ~/.hermes/hermes-agent
-scripts/run_tests.sh \
+venv/bin/pytest -q \
+  tests/agent/test_claude_code_cli_client.py \
+  tests/agent/test_credential_pool_routing.py \
+  tests/agent/test_credential_pool.py
+
+venv/bin/pytest -q \
+  tests/hermes_cli/test_runtime_provider_resolution.py \
+  tests/run_agent/test_run_agent.py
+```
+
+Current result: `675 passed, 0 failed` across these two groups.
+
+The older credential hydration regression set remains useful:
+
+```bash
+venv/bin/pytest -q \
   tests/agent/test_anthropic_keychain.py \
   tests/agent/test_anthropic_adapter.py \
   tests/agent/test_credential_pool.py \
-  tests/hermes_cli/test_auth_commands.py -q
+  tests/hermes_cli/test_auth_commands.py
 ```
-
-Current base result: `337 passed, 0 failed` across the focused files.
 
 Coverage includes:
 
@@ -45,11 +58,10 @@ Safe assertions:
 - no `access_token` or `refresh_token` keys in profile `auth.json`;
 - only the `codexauthtest` profile changed.
 
-For the 2026-07-14 live validation, the user explicitly authorized testing on
-`cz-claude`. Four credentials hydrated; three completed minimal live
-`claude-opus-4-8` requests. The default credential returned HTTP 429 and pool
-rotation selected the next healthy scoped entry. Future tests return to
-`codexauthtest` unless the user explicitly authorizes another profile.
+For the 2026-07-14 adapter validation, the user explicitly authorized one
+profile. The default directory returned HTTP 401; Hermes rotated automatically
+to the next configured directory, and official `claude -p` returned `OK`.
+Future tests use a dedicated test profile unless explicitly authorized.
 
 Do not print token values. Do not make a live Anthropic inference request
 unless the user explicitly authorizes usage consumption.
