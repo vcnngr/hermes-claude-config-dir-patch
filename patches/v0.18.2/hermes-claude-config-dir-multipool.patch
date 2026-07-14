@@ -259,7 +259,7 @@ index 689d010..e5ddb25 100644
          # Read existing file to preserve other fields
          existing = {}
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
-index 3bd5949..b9ace24 100644
+index 3bd5949..c5b8bd4 100644
 --- a/agent/credential_pool.py
 +++ b/agent/credential_pool.py
 @@ -125,9 +125,15 @@ _EXTRA_KEYS = frozenset({
@@ -400,7 +400,7 @@ index 3bd5949..b9ace24 100644
              entry.priority,
              entry.label,
          ),
-@@ -1891,36 +1928,121 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
+@@ -1891,36 +1928,129 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
              # transient 401 could revive them.
              retained = [
                  entry for entry in entries
@@ -466,7 +466,7 @@ index 3bd5949..b9ace24 100644
 +        # Normalize source ids before upsert so ordinary source-based pool
 +        # deduplication, removal and suppression remain isolated per account.
 +        configured_sources: Set[str] = set()
-+        for idx, entry in enumerate(list(entries)):
++        for idx, entry in enumerate(entries):
 +            if not _is_claude_code_source(entry.source) or not entry.claude_config_dir:
 +                continue
 +            resolved_dir = str(resolve_claude_config_dir(entry.claude_config_dir))
@@ -477,10 +477,18 @@ index 3bd5949..b9ace24 100644
 +                    entry,
 +                    source=source_name,
 +                    extra={**entry.extra, "claude_config_dir": resolved_dir},
-+                )
+                 )
 +                entry = entries[idx]
 +                changed = True
 +
++        # Hydrate only after every row has its unique source id. Hydrating the
++        # default ``claude_code`` row earlier would make _upsert_entry treat
++        # still-unprocessed scoped rows as duplicates and remove them.
++        for entry in list(entries):
++            if not _is_claude_code_source(entry.source) or not entry.claude_config_dir:
++                continue
++            resolved_dir = str(resolve_claude_config_dir(entry.claude_config_dir))
++            source_name = claude_code_pool_source(resolved_dir)
 +            if _is_suppressed(provider, source_name):
 +                continue
 +            # Preserve the mapping even while that Claude account is logged
@@ -520,7 +528,7 @@ index 3bd5949..b9ace24 100644
 +                    resolve_claude_config_dir(
 +                        ambient_creds.get("claude_config_dir") or ambient_dir
 +                    )
-                 )
++                )
 +                source_name = claude_code_pool_source(resolved_dir)
 +                if not _is_suppressed(provider, source_name):
 +                    active_sources.add(source_name)
@@ -729,23 +737,26 @@ index 97faca0..dc3d945 100644
          assert captured["refresh_token"] == "live-refresh"
 -
 diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
-index 68a9233..185b0cc 100644
+index 68a9233..c2d2ec6 100644
 --- a/tests/agent/test_credential_pool.py
 +++ b/tests/agent/test_credential_pool.py
-@@ -1725,6 +1725,99 @@ def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path,
+@@ -1725,6 +1725,126 @@ def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path,
      assert entry.access_token == "env-override-token"
  
  
 +def test_load_pool_hydrates_multiple_claude_config_directories(tmp_path, monkeypatch):
-+    """Two auth.json mappings must hydrate as two isolated Claude Code rows."""
++    """Default plus three scoped mappings hydrate without source deduplication."""
 +    hermes_home = tmp_path / "hermes"
++    default_dir = (tmp_path / ".claude").resolve()
 +    first_dir = (tmp_path / ".claude-work").resolve()
 +    second_dir = (tmp_path / ".claude-personal").resolve()
++    third_dir = (tmp_path / ".claude-third").resolve()
 +    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 +    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 +    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
 +    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 +    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
++    monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 +    _write_auth_store(
 +        tmp_path,
 +        {
@@ -753,10 +764,18 @@ index 68a9233..185b0cc 100644
 +            "credential_pool": {
 +                "anthropic": [
 +                    {
++                        "id": "cc-default",
++                        "label": "default",
++                        "auth_type": "oauth",
++                        "priority": 0,
++                        "source": "claude_code",
++                        "claude_config_dir": str(default_dir),
++                    },
++                    {
 +                        "id": "cc-work",
 +                        "label": "work",
 +                        "auth_type": "oauth",
-+                        "priority": 0,
++                        "priority": 1,
 +                        "source": "claude_code",
 +                        "CLAUDE_CONFIG_DIR": str(first_dir),
 +                    },
@@ -764,9 +783,17 @@ index 68a9233..185b0cc 100644
 +                        "id": "cc-personal",
 +                        "label": "personal",
 +                        "auth_type": "oauth",
-+                        "priority": 1,
++                        "priority": 2,
 +                        "source": "claude_code",
 +                        "claude_config_dir": str(second_dir),
++                    },
++                    {
++                        "id": "cc-third",
++                        "label": "third",
++                        "auth_type": "oauth",
++                        "priority": 3,
++                        "source": "claude_code",
++                        "claude_config_dir": str(third_dir),
 +                    },
 +                ]
 +            },
@@ -782,8 +809,10 @@ index 68a9233..185b0cc 100644
 +    )
 +
 +    tokens = {
++        str(default_dir): ("default-access", "default-refresh"),
 +        str(first_dir): ("work-access", "work-refresh"),
 +        str(second_dir): ("personal-access", "personal-refresh"),
++        str(third_dir): ("third-access", "third-refresh"),
 +    }
 +
 +    def _read_claude(config_dir=None):
@@ -806,17 +835,21 @@ index 68a9233..185b0cc 100644
 +
 +    entries = load_pool("anthropic").entries()
 +
-+    assert len(entries) == 2
++    assert len(entries) == 4
 +    assert {entry.runtime_api_key for entry in entries} == {
++        "default-access",
 +        "work-access",
 +        "personal-access",
++        "third-access",
 +    }
 +    assert {entry.claude_config_dir for entry in entries} == {
++        str(default_dir),
 +        str(first_dir),
 +        str(second_dir),
++        str(third_dir),
 +    }
-+    assert all(entry.source.startswith("claude_code:") for entry in entries)
-+    assert len({entry.source for entry in entries}) == 2
++    assert {entry.source == "claude_code" for entry in entries} == {True, False}
++    assert len({entry.source for entry in entries}) == 4
 +
 +    persisted = json.loads((hermes_home / "auth.json").read_text())
 +    rows = persisted["credential_pool"]["anthropic"]
@@ -824,8 +857,10 @@ index 68a9233..185b0cc 100644
 +    assert all("refresh_token" not in row for row in rows)
 +    assert all("CLAUDE_CONFIG_DIR" not in row for row in rows)
 +    assert {row["claude_config_dir"] for row in rows} == {
++        str(default_dir),
 +        str(first_dir),
 +        str(second_dir),
++        str(third_dir),
 +    }
 +
 +

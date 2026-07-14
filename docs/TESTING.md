@@ -34,9 +34,9 @@ Use only `codexauthtest`:
 HERMES_HOME=~/.hermes/profiles/codexauthtest hermes auth list anthropic
 ```
 
-Expected: at least two distinct `claude_code:<hash8>` rows mapped to the
-configured directories. The current validated pair was `.claude-work` and
-`.claude-peo`.
+Expected: the default `claude_code` row plus one distinct
+`claude_code:<hash8>` row for every configured alternative directory. Current
+validation covered default plus three alternatives in one profile.
 
 Safe assertions:
 
@@ -44,6 +44,12 @@ Safe assertions:
 - each persisted fingerprint matches the corresponding scoped Keychain item;
 - no `access_token` or `refresh_token` keys in profile `auth.json`;
 - only the `codexauthtest` profile changed.
+
+For the 2026-07-14 live validation, the user explicitly authorized testing on
+`cz-claude`. Four credentials hydrated; three completed minimal live
+`claude-opus-4-8` requests. The default credential returned HTTP 429 and pool
+rotation selected the next healthy scoped entry. Future tests return to
+`codexauthtest` unless the user explicitly authorizes another profile.
 
 Do not print token values. Do not make a live Anthropic inference request
 unless the user explicitly authorizes usage consumption.

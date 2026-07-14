@@ -38,7 +38,7 @@ git apply --3way "$PATCH"
 Patch SHA-256:
 
 ```text
-b6b085c805980f60cc17d0109d07e05b69c23ca5bf2e07f11743cbf706771774
+f24e9bb3b0d7e8266b25ad1c92924adff82e182c058dfb7783ace7f8935b9070
 ```
 
 ## Configure one Hermes profile
@@ -124,9 +124,10 @@ retire the downstream patch.
 
 ## Test result
 
-`337` focused Hermes tests passed on the supported base, plus a real local
-Keychain/pool hydration check with two distinct Claude Code accounts. No live
-Anthropic inference request was required.
+`337` focused Hermes tests passed on the supported base. A real four-account
+profile check hydrated four distinct Claude Code credentials: three completed
+live `claude-opus-4-8` requests, while one correctly returned HTTP 429 and the
+pool selected the next healthy account.
 
 ## License
 
