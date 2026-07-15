@@ -1,27 +1,48 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index c5826b4..b180aec 100644
+index c5826b4..98570e3 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -938,6 +938,17 @@ def init_agent(
-                 }
-             else:
-                 client_kwargs = {"api_key": api_key, "base_url": base_url}
-+            if str(base_url or "").startswith("acp://claude-code"):
-+                active_entry = None
-+                pool_entries = credential_pool.entries() if credential_pool is not None else []
-+                for candidate in pool_entries:
-+                    candidate_key = getattr(candidate, "runtime_api_key", None) or getattr(candidate, "access_token", "")
-+                    if candidate_key == api_key:
-+                        active_entry = candidate
-+                        break
-+                config_dir = getattr(active_entry, "claude_config_dir", None) if active_entry is not None else None
-+                if config_dir:
-+                    client_kwargs["claude_config_dir"] = config_dir
-             if _provider_timeout is not None:
-                 client_kwargs["timeout"] = _provider_timeout
-             if agent.provider == "copilot-acp":
+@@ -449,7 +449,7 @@ def init_agent(
+     agent._credential_pool = credential_pool
+     agent.acp_command = acp_command or command
+     agent.acp_args = list(acp_args or args or [])
+-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
++    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "claude_code"}:
+         agent.api_mode = api_mode
+     elif agent.provider == "openai-codex":
+         agent.api_mode = "codex_responses"
+@@ -892,6 +892,29 @@ def init_agent(
+         agent.base_url = "moa://local"
+         if not agent.quiet_mode:
+             print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
++    elif agent.api_mode == "claude_code":
++        # Claude Code owns inference and tool execution.  Preserve only the
++        # selected pool identity/config directory; no OpenAI/httpx client is
++        # constructed for the acp:// marker URL.
++        active_entry = None
++        pool_entries = credential_pool.entries() if credential_pool is not None else []
++        for candidate in pool_entries:
++            candidate_key = getattr(candidate, "runtime_api_key", None) or getattr(candidate, "access_token", "")
++            if candidate_key == api_key:
++                active_entry = candidate
++                break
++        client_kwargs = {"api_key": api_key, "base_url": base_url}
++        config_dir = getattr(active_entry, "claude_config_dir", None) if active_entry is not None else None
++        if config_dir:
++            client_kwargs["claude_config_dir"] = config_dir
++        if _provider_timeout is not None:
++            client_kwargs["timeout"] = _provider_timeout
++        agent._client_kwargs = client_kwargs
++        agent.api_key = api_key or "claude-code"
++        agent.base_url = base_url or "acp://claude-code"
++        agent.client = None
++        if not agent.quiet_mode:
++            print(f"🤖 AI Agent initialized with model: {agent.model} (Claude Code runtime)")
+     elif agent.api_mode == "bedrock_converse":
+         # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
+         # Region is extracted from the base_url or defaults to us-east-1.
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 1cde734..0dd291e 100644
+index 1cde734..3941914 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -704,8 +704,8 @@ def recover_with_credential_pool(
@@ -71,17 +92,6 @@ index 1cde734..0dd291e 100644
          # Subscription/entitlement 403s look like auth failures on the wire
          # but refresh cannot fix them — the OAuth token is already valid,
          # the account simply lacks the entitlement.  Without this guard,
-@@ -1702,6 +1722,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
-             agent._client_log_context(),
-         )
-         return client
-+    if str(client_kwargs.get("base_url", "")).startswith("acp://claude-code"):
-+        from agent.claude_code_cli_client import ClaudeCodeCLIClient
-+
-+        return ClaudeCodeCLIClient(**client_kwargs)
-     if agent.provider == "gemini":
-         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
- 
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
 index 689d010..e5ddb25 100644
 --- a/agent/anthropic_adapter.py
@@ -342,226 +352,423 @@ index 689d010..e5ddb25 100644
      try:
          # Read existing file to preserve other fields
          existing = {}
-diff --git a/agent/claude_code_cli_client.py b/agent/claude_code_cli_client.py
+diff --git a/agent/claude_runtime.py b/agent/claude_runtime.py
 new file mode 100644
-index 0000000..fd778c5
+index 0000000..ec0f4c8
 --- /dev/null
-+++ b/agent/claude_code_cli_client.py
-@@ -0,0 +1,214 @@
-+"""OpenAI-compatible facade backed by the official ``claude -p`` CLI."""
++++ b/agent/claude_runtime.py
+@@ -0,0 +1,388 @@
++"""Claude Code external-agent runtime.
++
++This path bypasses Hermes' model/tool loop.  Claude Code receives the complete
++turn, executes Bash/file/MCP tools itself, and emits a stream that Hermes only
++displays and persists.  This ownership boundary prevents double execution.
++"""
 +
 +from __future__ import annotations
 +
-+import json
++import logging
 +import os
-+import shutil
-+import subprocess
-+import threading
-+from pathlib import Path
-+from types import SimpleNamespace
-+from typing import Any
-+
-+from agent.copilot_acp_client import _completion_to_stream_chunks
-+from tools.environments.local import hermes_subprocess_env
++from typing import Any, Dict, List
 +
 +
-+CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
-+_DEFAULT_TIMEOUT_SECONDS = 900.0
++logger = logging.getLogger(__name__)
 +
 +
-+class ClaudeCodeCLIError(RuntimeError):
-+    def __init__(self, message: str, *, status_code: int = 500):
-+        super().__init__(message)
-+        self.status_code = status_code
++def _as_nonnegative_int(value: Any) -> int:
++    try:
++        return max(int(value or 0), 0)
++    except (TypeError, ValueError):
++        return 0
 +
 +
-+def _render_content(content: Any) -> str:
-+    if isinstance(content, str):
-+        return content.strip()
-+    if isinstance(content, list):
-+        parts = []
-+        for item in content:
-+            if isinstance(item, str):
-+                parts.append(item)
-+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
-+                parts.append(item["text"])
-+        return "\n".join(parts).strip()
-+    if content is None:
-+        return ""
-+    return json.dumps(content, ensure_ascii=False)
++def _selected_claude_config_dir(agent) -> str:
++    configured = str(
++        (getattr(agent, "_client_kwargs", {}) or {}).get("claude_config_dir") or ""
++    ).strip()
++    if configured:
++        return configured
++
++    pool = getattr(agent, "_credential_pool", None)
++    if pool is not None:
++        entry = pool.current() or pool.peek()
++        config_dir = str(getattr(entry, "claude_config_dir", None) or "").strip()
++        if config_dir:
++            return config_dir
++    return "~/.claude"
 +
 +
-+def _format_prompt(messages: list[dict[str, Any]]) -> str:
-+    transcript = []
-+    for message in messages:
-+        if not isinstance(message, dict):
++def _compose_claude_delivery_text(turn) -> str:
++    """Return the complete user-facing text emitted during one Claude turn.
++
++    Claude Code's terminal ``result`` event contains only the final assistant
++    block.  In a multi-step turn Claude can write the substantive answer,
++    invoke a control tool such as ``ScheduleWakeup``, then finish with a short
++    acknowledgement (for example, "Waiting").  Returning only ``final_text``
++    drops the answer even though the earlier assistant event was persisted.
++
++    Standalone assistant messages are user-facing output.  Text attached to a
++    tool call is usually an execution preamble, so keep the established
++    terminal-result behaviour unless a distinct standalone answer exists.
++    """
++    terminal = str(getattr(turn, "final_text", "") or "").strip()
++    parts: list[str] = []
++
++    for message in getattr(turn, "projected_messages", None) or []:
++        if not isinstance(message, dict) or message.get("role") != "assistant":
 +            continue
-+        text = _render_content(message.get("content"))
-+        if text:
-+            transcript.append(f"{str(message.get('role') or 'context').upper()}:\n{text}")
-+    return (
-+        "Continue this Hermes conversation. Follow system instructions and answer the latest user.\n\n"
-+        + "\n\n".join(transcript)
++        if message.get("tool_calls"):
++            continue
++        content = message.get("content")
++        if not isinstance(content, str):
++            continue
++        text = content.strip()
++        if not text or text == terminal or text in parts:
++            continue
++        # Some Claude CLI versions may already aggregate prior assistant text
++        # into the result event.  Do not prepend it a second time.
++        if terminal and text in terminal:
++            continue
++        parts.append(text)
++
++    if terminal:
++        parts.append(terminal)
++    return "\n\n".join(parts)
++
++
++def _record_claude_usage(agent, turn, *, api_calls: int) -> dict[str, Any]:
++    agent.session_api_calls += api_calls
++    usage = turn.token_usage if isinstance(turn.token_usage, dict) else {}
++    if not usage:
++        return {}
++
++    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
++
++    canonical = CanonicalUsage(
++        input_tokens=_as_nonnegative_int(usage.get("input_tokens")),
++        output_tokens=_as_nonnegative_int(usage.get("output_tokens")),
++        cache_read_tokens=_as_nonnegative_int(
++            usage.get("cache_read_input_tokens") or usage.get("cache_read_tokens")
++        ),
++        cache_write_tokens=_as_nonnegative_int(
++            usage.get("cache_creation_input_tokens") or usage.get("cache_write_tokens")
++        ),
++        reasoning_tokens=0,
++        raw_usage=usage,
++    )
++    prompt_tokens = canonical.prompt_tokens
++    completion_tokens = canonical.output_tokens
++    total_tokens = canonical.total_tokens
++    usage_dict = {
++        "prompt_tokens": prompt_tokens,
++        "completion_tokens": completion_tokens,
++        "total_tokens": total_tokens,
++        "input_tokens": canonical.input_tokens,
++        "output_tokens": canonical.output_tokens,
++        "cache_read_tokens": canonical.cache_read_tokens,
++        "cache_write_tokens": canonical.cache_write_tokens,
++        "reasoning_tokens": 0,
++    }
++
++    compressor = getattr(agent, "context_compressor", None)
++    if compressor is not None:
++        try:
++            compressor.update_from_response(usage_dict)
++        except Exception:
++            logger.debug("Claude Code usage update failed", exc_info=True)
++
++    agent.session_prompt_tokens += prompt_tokens
++    agent.session_completion_tokens += completion_tokens
++    agent.session_total_tokens += total_tokens
++    agent.session_input_tokens += canonical.input_tokens
++    agent.session_output_tokens += canonical.output_tokens
++    agent.session_cache_read_tokens += canonical.cache_read_tokens
++    agent.session_cache_write_tokens += canonical.cache_write_tokens
++
++    cost_result = estimate_usage_cost(
++        agent.model,
++        canonical,
++        provider=agent.provider,
++        base_url=agent.base_url,
++        api_key=getattr(agent, "api_key", ""),
++    )
++    if cost_result.amount_usd is not None:
++        agent.session_estimated_cost_usd += float(cost_result.amount_usd)
++    agent.session_cost_status = cost_result.status
++    agent.session_cost_source = cost_result.source
++
++    if agent._session_db and agent.session_id:
++        try:
++            if not agent._session_db_created:
++                agent._ensure_db_session()
++            agent._session_db.update_token_counts(
++                agent.session_id,
++                input_tokens=canonical.input_tokens,
++                output_tokens=canonical.output_tokens,
++                cache_read_tokens=canonical.cache_read_tokens,
++                cache_write_tokens=canonical.cache_write_tokens,
++                reasoning_tokens=0,
++                estimated_cost_usd=float(cost_result.amount_usd)
++                if cost_result.amount_usd is not None
++                else None,
++                cost_status=cost_result.status,
++                cost_source=cost_result.source,
++                billing_provider=agent.provider,
++                billing_base_url=agent.base_url,
++                billing_mode="subscription_included",
++                model=agent.model,
++                api_call_count=api_calls,
++            )
++        except Exception:
++            logger.debug("Claude Code token persistence failed", exc_info=True)
++
++    return {
++        **usage_dict,
++        "last_prompt_tokens": prompt_tokens,
++        "estimated_cost_usd": float(cost_result.amount_usd)
++        if cost_result.amount_usd is not None
++        else None,
++        "cost_status": cost_result.status,
++        "cost_source": cost_result.source,
++    }
++
++
++def run_claude_code_turn(
++    agent,
++    *,
++    user_message: str,
++    original_user_message: Any,
++    messages: List[Dict[str, Any]],
++    active_system_prompt: str,
++    effective_task_id: str,
++    should_review_memory: bool = False,
++) -> Dict[str, Any]:
++    from agent.runtime_cwd import resolve_agent_cwd
++    from agent.transports.claude_code_session import (
++        ClaudeCodeSession,
++        build_turn_prompt,
 +    )
 +
++    cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
++    permission_mode = os.environ.get(
++        "HERMES_CLAUDE_PERMISSION_MODE", "auto"
++    ).strip() or "auto"
++    expose_hermes_tools = os.environ.get(
++        "HERMES_CLAUDE_HERMES_TOOLS", "1"
++    ).strip().lower() not in {"0", "false", "no", "off"}
 +
-+def _status_for_error(text: str) -> int:
-+    lower = text.lower()
-+    if any(term in lower for term in ("rate limit", "usage limit", "hit your limit", "limit reached", "resets at")):
-+        return 429
-+    if any(term in lower for term in ("not logged in", "authentication", "unauthorized", "invalid token")):
-+        return 401
-+    return 500
++    def _on_text_delta(text: str) -> None:
++        agent._touch_activity("receiving Claude Code stream")
++        agent._fire_stream_delta(text)
 +
++    def _on_reasoning_delta(text: str) -> None:
++        agent._touch_activity("receiving Claude Code reasoning")
++        agent._fire_reasoning_delta(text)
 +
-+class _ChatCompletions:
-+    def __init__(self, client: "ClaudeCodeCLIClient"):
-+        self._client = client
-+
-+    def create(self, **kwargs: Any) -> Any:
-+        return self._client._create_chat_completion(**kwargs)
-+
-+
-+class _Chat:
-+    def __init__(self, client: "ClaudeCodeCLIClient"):
-+        self.completions = _ChatCompletions(client)
-+
-+
-+class ClaudeCodeCLIClient:
-+    """Run each Hermes model turn through official Claude Code."""
-+
-+    def __init__(
-+        self,
-+        *,
-+        api_key: str | None = None,
-+        base_url: str | None = None,
-+        claude_config_dir: str | None = None,
-+        timeout: Any = None,
-+        **_: Any,
-+    ):
-+        self.api_key = api_key or "claude-code-cli"
-+        self.base_url = base_url or CLAUDE_CODE_MARKER_BASE_URL
-+        self.claude_config_dir = str(Path(claude_config_dir or "~/.claude").expanduser().resolve())
-+        self.timeout = timeout
-+        self.chat = _Chat(self)
-+        self.is_closed = False
-+        self._active_process: subprocess.Popen[str] | None = None
-+        self._lock = threading.Lock()
-+
-+    def close(self) -> None:
-+        with self._lock:
-+            proc = self._active_process
-+            self._active_process = None
-+        self.is_closed = True
-+        if proc and proc.poll() is None:
-+            proc.terminate()
-+
-+    def _subprocess_env(self) -> dict[str, str]:
-+        env = hermes_subprocess_env(inherit_credentials=True)
-+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDECODE"):
-+            env.pop(key, None)
-+        env["CLAUDE_CONFIG_DIR"] = self.claude_config_dir
-+        env.setdefault("HOME", os.path.expanduser("~"))
-+        return env
-+
-+    def _effective_timeout(self, timeout: Any) -> float:
-+        value = timeout if timeout is not None else self.timeout
-+        if isinstance(value, (int, float)) and value > 0:
-+            return float(value)
-+        candidates = [getattr(value, key, None) for key in ("read", "write", "connect", "pool")]
-+        numeric = [float(item) for item in candidates if isinstance(item, (int, float)) and item > 0]
-+        return max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
-+
-+    def _run(self, prompt: str, *, model: str, timeout: float) -> dict[str, Any]:
-+        command = shutil.which("claude")
-+        if not command:
-+            raise ClaudeCodeCLIError("Claude Code CLI not found", status_code=503)
-+        args = [
-+            command,
-+            "-p",
-+            prompt,
-+            "--model",
-+            model,
-+            "--output-format",
-+            "json",
-+            "--no-session-persistence",
-+        ]
-+        proc = subprocess.Popen(
-+            args,
-+            stdout=subprocess.PIPE,
-+            stderr=subprocess.PIPE,
-+            text=True,
-+            cwd=os.getcwd(),
-+            env=self._subprocess_env(),
-+        )
-+        self.is_closed = False
-+        with self._lock:
-+            self._active_process = proc
-+        try:
-+            stdout, stderr = proc.communicate(timeout=timeout)
-+        except subprocess.TimeoutExpired as exc:
-+            proc.kill()
-+            proc.communicate()
-+            raise ClaudeCodeCLIError("Claude Code CLI timed out", status_code=504) from exc
-+        finally:
-+            with self._lock:
-+                if self._active_process is proc:
-+                    self._active_process = None
-+
-+        payload = None
-+        for line in reversed(stdout.splitlines()):
++    def _on_tool_started(name: str, args: dict[str, Any]) -> None:
++        agent._touch_activity(f"Claude Code executing tool: {name}")
++        agent._fire_tool_gen_started(name)
++        if agent.stream_delta_callback:
 +            try:
-+                candidate = json.loads(line)
++                agent.stream_delta_callback(None)
 +            except Exception:
-+                continue
-+            if isinstance(candidate, dict):
-+                payload = candidate
-+                break
-+        if payload is None:
-+            message = (stderr or stdout or "Claude Code CLI returned no JSON").strip()
-+            raise ClaudeCodeCLIError(message[:1000], status_code=_status_for_error(message))
-+        if proc.returncode != 0 or payload.get("is_error"):
-+            message = str(payload.get("result") or stderr or "Claude Code CLI failed")
-+            raise ClaudeCodeCLIError(message[:1000], status_code=int(payload.get("api_error_status") or _status_for_error(message)))
-+        return payload
++                pass
++        callback = getattr(agent, "tool_progress_callback", None)
++        if callback is not None:
++            try:
++                callback("tool.started", name, name, args)
++            except Exception:
++                logger.debug("Claude tool-start callback failed", exc_info=True)
 +
-+    def _create_chat_completion(
-+        self,
-+        *,
-+        model: str | None = None,
-+        messages: list[dict[str, Any]] | None = None,
-+        timeout: Any = None,
-+        stream: bool = False,
-+        **_: Any,
-+    ) -> Any:
-+        selected_model = model or "claude-sonnet-4-6"
-+        payload = self._run(
-+            _format_prompt(messages or []),
-+            model=selected_model,
-+            timeout=self._effective_timeout(timeout),
++    def _on_tool_completed(name: str) -> None:
++        agent._touch_activity(f"Claude Code completed tool: {name}")
++        callback = getattr(agent, "tool_progress_callback", None)
++        if callback is not None:
++            try:
++                callback("tool.completed", name, None, None)
++            except Exception:
++                logger.debug("Claude tool-complete callback failed", exc_info=True)
++
++    def _on_status(text: str) -> None:
++        agent._touch_activity(text)
++        try:
++            agent._emit_status(text)
++        except Exception:
++            logger.debug("Claude status callback failed", exc_info=True)
++
++    prompt = build_turn_prompt(
++        system_prompt=active_system_prompt or "",
++        messages=messages,
++    )
++    pool = getattr(agent, "_credential_pool", None)
++    pool_size = len(pool.entries()) if pool is not None else 1
++    max_attempts = max(pool_size, 1)
++    has_retried_429 = False
++    attempts = 0
++    turn = None
++    tried_dirs: set[str] = set()
++
++    while attempts < max_attempts:
++        config_dir = _selected_claude_config_dir(agent)
++        if config_dir in tried_dirs:
++            break
++        tried_dirs.add(config_dir)
++        attempts += 1
++
++        session = ClaudeCodeSession(
++            claude_config_dir=config_dir,
++            cwd=cwd,
++            model=agent.model,
++            permission_mode=permission_mode,
++            expose_hermes_tools=expose_hermes_tools,
++            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
++            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
++            on_text_delta=_on_text_delta,
++            on_reasoning_delta=_on_reasoning_delta,
++            on_tool_started=_on_tool_started,
++            on_tool_completed=_on_tool_completed,
++            on_status=_on_status,
 +        )
-+        usage_data = payload.get("usage") or {}
-+        prompt_tokens = int(usage_data.get("input_tokens") or 0)
-+        completion_tokens = int(usage_data.get("output_tokens") or 0)
-+        usage = SimpleNamespace(
-+            prompt_tokens=prompt_tokens,
-+            completion_tokens=completion_tokens,
-+            total_tokens=prompt_tokens + completion_tokens,
-+            prompt_tokens_details=SimpleNamespace(cached_tokens=int(usage_data.get("cache_read_input_tokens") or 0)),
++        agent._claude_code_session = session
++        try:
++            turn = session.run_turn(prompt=prompt)
++        finally:
++            session.close()
++            if getattr(agent, "_claude_code_session", None) is session:
++                agent._claude_code_session = None
++
++        if turn.error is None or turn.interrupted:
++            break
++        if turn.status_code not in {401, 429}:
++            break
++        # A retry replays the whole turn in another Claude process. Never do
++        # that after a native tool started: Bash/Edit/MCP side effects may
++        # already have happened even when the provider later returned 401/429.
++        if turn.side_effects_possible:
++            _on_status("Claude credential failed after tool execution; not replaying turn")
++            break
++
++        recovered, has_retried_429 = agent._recover_with_credential_pool(
++            status_code=turn.status_code,
++            has_retried_429=has_retried_429,
++            error_context={
++                "message": turn.error,
++                "reason": "claude_code_runtime",
++            },
 +        )
-+        message = SimpleNamespace(
-+            content=str(payload.get("result") or ""),
-+            tool_calls=None,
-+            reasoning=None,
-+            reasoning_content=None,
-+            reasoning_details=None,
++        if not recovered:
++            break
++        _on_status("Claude credential rotated; retrying turn")
++
++    if turn is None:
++        return {
++            "final_response": "Claude Code runtime could not select a credential.",
++            "messages": messages,
++            "api_calls": attempts,
++            "completed": False,
++            "partial": True,
++            "error": "no Claude Code credential available",
++            "agent_persisted": True,
++        }
++
++    delivery_text = (
++        _compose_claude_delivery_text(turn)
++        if turn.error is None
++        else turn.final_text
++    )
++
++    if turn.projected_messages:
++        messages.extend(turn.projected_messages)
++    if turn.final_text and not any(
++        msg.get("role") == "assistant" and msg.get("content") == turn.final_text
++        for msg in turn.projected_messages[-2:]
++        if isinstance(msg, dict)
++    ):
++        messages.append({"role": "assistant", "content": turn.final_text})
++
++    if getattr(agent, "_session_db", None) is not None:
++        try:
++            agent._flush_messages_to_session_db(messages)
++        except Exception:
++            logger.debug("Claude projected-message flush failed", exc_info=True)
++
++    agent._iters_since_skill = (
++        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
++    )
++    should_review_skills = False
++    if (
++        agent._skill_nudge_interval > 0
++        and agent._iters_since_skill >= agent._skill_nudge_interval
++        and "skill_manage" in agent.valid_tool_names
++    ):
++        should_review_skills = True
++        agent._iters_since_skill = 0
++
++    if not turn.interrupted and turn.error is None:
++        try:
++            agent._sync_external_memory_for_turn(
++                original_user_message=original_user_message,
++                final_response=delivery_text,
++                interrupted=False,
++                messages=messages,
++            )
++        except Exception:
++            logger.debug("Claude external memory sync failed", exc_info=True)
++
++    if (
++        delivery_text
++        and not turn.interrupted
++        and turn.error is None
++        and (should_review_memory or should_review_skills)
++    ):
++        try:
++            agent._spawn_background_review(
++                messages_snapshot=list(messages),
++                review_memory=should_review_memory,
++                review_skills=should_review_skills,
++            )
++        except Exception:
++            logger.debug("Claude background review failed", exc_info=True)
++
++    usage_result = _record_claude_usage(agent, turn, api_calls=attempts)
++    final_response = delivery_text or (turn.error or "")
++    return {
++        "final_response": final_response,
++        "messages": messages,
++        "api_calls": attempts,
++        "completed": not turn.interrupted and turn.error is None,
++        "partial": turn.interrupted or turn.error is not None,
++        "error": turn.error,
++        "agent_persisted": True,
++        "claude_session_id": turn.session_id,
++        **usage_result,
++    }
++
++
++__all__ = ["run_claude_code_turn"]
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 12c80a8..72bfbe6 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -640,6 +640,18 @@ def run_conversation(
+             should_review_memory=_should_review_memory,
+         )
+ 
++    # Official Claude Code runtime. Claude owns Bash/file/MCP execution and
++    # streams progress into Hermes; this bypass prevents double execution.
++    if agent.api_mode == "claude_code":
++        return agent._run_claude_code_turn(
++            user_message=user_message,
++            original_user_message=original_user_message,
++            messages=messages,
++            active_system_prompt=active_system_prompt,
++            effective_task_id=effective_task_id,
++            should_review_memory=_should_review_memory,
 +        )
-+        completion = SimpleNamespace(
-+            choices=[SimpleNamespace(message=message, finish_reason="stop")],
-+            usage=usage,
-+            model=selected_model,
-+        )
-+        return _completion_to_stream_chunks(completion) if stream else completion
++
+     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
+         agent._checkpoint_mgr.new_turn()
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
 index 3bd5949..b25158b 100644
 --- a/agent/credential_pool.py
@@ -895,17 +1102,1045 @@ index 18f0823..78b26dd 100644
          remove_fn=_remove_claude_code,
          description="~/.claude/.credentials.json",
      ))
+diff --git a/agent/transports/claude_code_session.py b/agent/transports/claude_code_session.py
+new file mode 100644
+index 0000000..e7c8bd6
+--- /dev/null
++++ b/agent/transports/claude_code_session.py
+@@ -0,0 +1,559 @@
++"""Streaming Claude Code runtime for Hermes.
++
++Claude Code owns the agent loop and executes its native tools.  This module
++only transports one Hermes turn to ``claude -p``, streams progress back to
++Hermes, and projects completed Claude messages into Hermes' transcript shape.
++Projected tool calls are history records; callers must never dispatch them
++through Hermes' tool executor a second time.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import queue
++import shutil
++import subprocess
++import sys
++import threading
++import time
++from collections import deque
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++from agent.redact import redact_sensitive_text
++from tools.environments.local import hermes_subprocess_env
++
++
++logger = logging.getLogger(__name__)
++
++_DEFAULT_TURN_TIMEOUT = 900.0
++_STDERR_TAIL_LINES = 80
++
++
++def _status_for_error(text: str) -> int:
++    lower = (text or "").lower()
++    if any(
++        term in lower
++        for term in (
++            "rate limit",
++            "usage limit",
++            "hit your limit",
++            "limit reached",
++            "resets at",
++            "error_max_budget",
++        )
++    ):
++        return 429
++    if any(
++        term in lower
++        for term in (
++            "not logged in",
++            "authentication",
++            "unauthorized",
++            "invalid token",
++            "oauth session expired",
++            "could not be refreshed",
++        )
++    ):
++        return 401
++    return 500
++
++
++def _render_content(content: Any, *, limit: int = 12000) -> str:
++    if isinstance(content, str):
++        return content[:limit]
++    if isinstance(content, list):
++        parts: list[str] = []
++        for item in content:
++            if isinstance(item, str):
++                parts.append(item)
++            elif isinstance(item, dict):
++                text = item.get("text")
++                if isinstance(text, str):
++                    parts.append(text)
++                elif item.get("type") == "tool_result":
++                    parts.append(_render_content(item.get("content"), limit=limit))
++        return "\n".join(parts)[:limit]
++    if content is None:
++        return ""
++    try:
++        return json.dumps(content, ensure_ascii=False)[:limit]
++    except (TypeError, ValueError):
++        return str(content)[:limit]
++
++
++def build_turn_prompt(
++    *,
++    system_prompt: str,
++    messages: list[dict[str, Any]],
++) -> str:
++    """Build a bounded, role-labelled prompt and send it over stdin.
++
++    stdin keeps profile instructions and conversation data out of the process
++    command line.  ``messages`` has already passed Hermes compression before
++    this function runs.
++    """
++    sections = [
++        "Continue this Hermes conversation and complete the latest user request. "
++        "Operate autonomously with Claude Code tools when useful.\n",
++    ]
++    if system_prompt:
++        sections.append(f"HERMES SYSTEM INSTRUCTIONS:\n{system_prompt}\n")
++
++    transcript: list[str] = []
++    for message in messages:
++        if not isinstance(message, dict):
++            continue
++        role = str(message.get("role") or "context").upper()
++        text = _render_content(message.get("content"))
++        tool_calls = message.get("tool_calls") or []
++        if tool_calls:
++            names: list[str] = []
++            for call in tool_calls:
++                if not isinstance(call, dict):
++                    continue
++                fn = call.get("function") or {}
++                if isinstance(fn, dict) and fn.get("name"):
++                    names.append(str(fn["name"]))
++            if names:
++                suffix = f"[completed tool calls in prior context: {', '.join(names)}]"
++                text = f"{text}\n{suffix}" if text else suffix
++        if text:
++            transcript.append(f"{role}:\n{text}")
++    if transcript:
++        sections.append("CONVERSATION TRANSCRIPT:\n" + "\n\n".join(transcript))
++    return "\n\n".join(sections)
++
++
++def _tool_result_text(block: dict[str, Any]) -> str:
++    text = _render_content(block.get("content"), limit=16000)
++    if block.get("is_error"):
++        return f"[error]\n{text}" if text else "[error]"
++    return text
++
++
++@dataclass
++class ClaudeTurnResult:
++    final_text: str = ""
++    projected_messages: list[dict[str, Any]] = field(default_factory=list)
++    token_usage: dict[str, Any] = field(default_factory=dict)
++    session_id: Optional[str] = None
++    tool_iterations: int = 0
++    error: Optional[str] = None
++    status_code: Optional[int] = None
++    interrupted: bool = False
++    should_retire: bool = False
++    side_effects_possible: bool = False
++
++
++class ClaudeEventProjector:
++    """Project complete Claude SDK messages into Hermes transcript entries."""
++
++    def __init__(self) -> None:
++        self._tool_names: dict[str, str] = {}
++
++    def tool_name(self, tool_use_id: str) -> str:
++        return self._tool_names.get(tool_use_id, "ClaudeTool")
++
++    def project(self, payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
++        kind = payload.get("type")
++        message = payload.get("message") or {}
++        if not isinstance(message, dict):
++            return [], 0
++        content = message.get("content") or []
++        if not isinstance(content, list):
++            content = [{"type": "text", "text": _render_content(content)}]
++
++        if kind == "assistant":
++            text_parts: list[str] = []
++            calls: list[dict[str, Any]] = []
++            for block in content:
++                if not isinstance(block, dict):
++                    continue
++                block_type = block.get("type")
++                if block_type == "text" and isinstance(block.get("text"), str):
++                    text_parts.append(block["text"])
++                elif block_type == "tool_use":
++                    call_id = str(block.get("id") or "")
++                    name = str(block.get("name") or "ClaudeTool")
++                    if call_id:
++                        self._tool_names[call_id] = name
++                    args = block.get("input") or {}
++                    try:
++                        arg_text = json.dumps(args, ensure_ascii=False, sort_keys=True)
++                    except (TypeError, ValueError):
++                        arg_text = json.dumps({"input": str(args)}, ensure_ascii=False)
++                    calls.append(
++                        {
++                            "id": call_id or f"claude_tool_{len(calls)}",
++                            "type": "function",
++                            "function": {"name": name, "arguments": arg_text},
++                        }
++                    )
++            if not text_parts and not calls:
++                return [], 0
++            projected: dict[str, Any] = {
++                "role": "assistant",
++                "content": "\n".join(text_parts) or None,
++            }
++            if calls:
++                projected["tool_calls"] = calls
++            return [projected], 0
++
++        if kind == "user":
++            messages: list[dict[str, Any]] = []
++            for block in content:
++                if not isinstance(block, dict) or block.get("type") != "tool_result":
++                    continue
++                call_id = str(block.get("tool_use_id") or "")
++                messages.append(
++                    {
++                        "role": "tool",
++                        "name": self.tool_name(call_id),
++                        "tool_name": self.tool_name(call_id),
++                        "tool_call_id": call_id,
++                        "content": _tool_result_text(block),
++                    }
++                )
++            return messages, len(messages)
++
++        return [], 0
++
++
++class ClaudeCodeSession:
++    """One active Claude Code subprocess at a time, owned by an AIAgent turn."""
++
++    def __init__(
++        self,
++        *,
++        claude_config_dir: str,
++        cwd: str,
++        model: str,
++        permission_mode: str = "auto",
++        expose_hermes_tools: bool = True,
++        enabled_toolsets: Optional[list[str]] = None,
++        disabled_toolsets: Optional[list[str]] = None,
++        claude_bin: str = "claude",
++        on_text_delta: Optional[Callable[[str], None]] = None,
++        on_reasoning_delta: Optional[Callable[[str], None]] = None,
++        on_tool_started: Optional[Callable[[str, dict[str, Any]], None]] = None,
++        on_tool_completed: Optional[Callable[[str], None]] = None,
++        on_status: Optional[Callable[[str], None]] = None,
++    ) -> None:
++        self.claude_config_dir = str(Path(claude_config_dir).expanduser().resolve())
++        self.cwd = str(Path(cwd).expanduser().resolve())
++        self.model = model
++        self.permission_mode = permission_mode
++        self.expose_hermes_tools = expose_hermes_tools
++        self.enabled_toolsets = enabled_toolsets
++        self.disabled_toolsets = disabled_toolsets
++        self.claude_bin = claude_bin
++        self.on_text_delta = on_text_delta
++        self.on_reasoning_delta = on_reasoning_delta
++        self.on_tool_started = on_tool_started
++        self.on_tool_completed = on_tool_completed
++        self.on_status = on_status
++        self._active_process: Optional[subprocess.Popen[str]] = None
++        self._lock = threading.Lock()
++        self._interrupt_event = threading.Event()
++
++    def _environment(self) -> dict[str, str]:
++        env = hermes_subprocess_env(inherit_credentials=True)
++        for key in (
++            "ANTHROPIC_API_KEY",
++            "ANTHROPIC_AUTH_TOKEN",
++            "ANTHROPIC_TOKEN",
++            "CLAUDE_CODE_OAUTH_TOKEN",
++            "CLAUDECODE",
++            "ANTHROPIC_BASE_URL",
++            "ANTHROPIC_CUSTOM_HEADERS",
++            "CLAUDE_CODE_USE_BEDROCK",
++            "CLAUDE_CODE_USE_VERTEX",
++            "CLAUDE_CODE_USE_FOUNDRY",
++        ):
++            env.pop(key, None)
++        env["CLAUDE_CONFIG_DIR"] = self.claude_config_dir
++        env.setdefault("HOME", os.path.expanduser("~"))
++        return env
++
++    def _hermes_mcp_config(self) -> str:
++        project_root = str(Path(__file__).resolve().parents[2])
++        server_env = {
++            "PYTHONPATH": project_root,
++            "HERMES_MCP_QUIET": "1",
++        }
++        hermes_home = os.environ.get("HERMES_HOME", "").strip()
++        if hermes_home:
++            server_env["HERMES_HOME"] = hermes_home
++        if self.enabled_toolsets is not None:
++            server_env["HERMES_EXTERNAL_ENABLED_TOOLSETS"] = json.dumps(
++                self.enabled_toolsets
++            )
++        if self.disabled_toolsets is not None:
++            server_env["HERMES_EXTERNAL_DISABLED_TOOLSETS"] = json.dumps(
++                self.disabled_toolsets
++            )
++        return json.dumps(
++            {
++                "mcpServers": {
++                    "hermes-tools": {
++                        "command": sys.executable,
++                        "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
++                        "env": server_env,
++                    }
++                }
++            },
++            ensure_ascii=False,
++        )
++
++    def _command(self) -> list[str]:
++        command = shutil.which(self.claude_bin)
++        if not command:
++            raise RuntimeError("Claude Code CLI not found")
++        args = [
++            command,
++            "-p",
++            "--model",
++            self.model,
++            "--output-format",
++            "stream-json",
++            "--verbose",
++            "--include-partial-messages",
++            "--no-session-persistence",
++            "--permission-mode",
++            self.permission_mode,
++            "--tools",
++            "default",
++        ]
++        if self.expose_hermes_tools:
++            args.extend(["--mcp-config", self._hermes_mcp_config()])
++        return args
++
++    def request_interrupt(self) -> None:
++        self._interrupt_event.set()
++        with self._lock:
++            proc = self._active_process
++        if proc is not None and proc.poll() is None:
++            try:
++                proc.terminate()
++            except Exception:
++                logger.debug("Claude Code terminate failed", exc_info=True)
++
++    def close(self) -> None:
++        with self._lock:
++            proc = self._active_process
++        if proc is not None and proc.poll() is None:
++            self.request_interrupt()
++
++    def run_turn(
++        self,
++        *,
++        prompt: str,
++        timeout: float = _DEFAULT_TURN_TIMEOUT,
++    ) -> ClaudeTurnResult:
++        result = ClaudeTurnResult()
++        projector = ClaudeEventProjector()
++        stdout_queue: queue.Queue[tuple[str, Optional[str]]] = queue.Queue()
++        stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
++        saw_result = False
++        self._interrupt_event.clear()
++
++        try:
++            proc = subprocess.Popen(
++                self._command(),
++                stdin=subprocess.PIPE,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                text=True,
++                bufsize=1,
++                cwd=self.cwd,
++                env=self._environment(),
++            )
++        except Exception as exc:
++            result.error = f"Claude Code startup failed: {exc}"
++            result.status_code = 503
++            result.should_retire = True
++            return result
++
++        with self._lock:
++            self._active_process = proc
++
++        def _read_stdout() -> None:
++            try:
++                assert proc.stdout is not None
++                for line in proc.stdout:
++                    stdout_queue.put(("line", line))
++            finally:
++                stdout_queue.put(("eof", None))
++
++        def _read_stderr() -> None:
++            try:
++                assert proc.stderr is not None
++                for line in proc.stderr:
++                    stderr_tail.append(line.rstrip())
++            except Exception:
++                pass
++
++        stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
++        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
++        stdout_thread.start()
++        stderr_thread.start()
++
++        try:
++            assert proc.stdin is not None
++            proc.stdin.write(prompt)
++            proc.stdin.close()
++        except Exception as exc:
++            self.request_interrupt()
++            result.error = f"Claude Code input failed: {exc}"
++            result.status_code = 500
++            result.should_retire = True
++
++        deadline = time.monotonic() + max(float(timeout), 1.0)
++        reached_eof = False
++        while not reached_eof and result.error is None:
++            if self._interrupt_event.is_set():
++                result.interrupted = True
++                break
++            if time.monotonic() >= deadline:
++                result.error = f"Claude Code turn timed out after {timeout:.0f}s"
++                result.status_code = 504
++                result.interrupted = True
++                result.should_retire = True
++                self.request_interrupt()
++                break
++            try:
++                item_type, raw_line = stdout_queue.get(timeout=0.25)
++            except queue.Empty:
++                if proc.poll() is not None and not stdout_thread.is_alive():
++                    reached_eof = True
++                continue
++            if item_type == "eof":
++                reached_eof = True
++                continue
++            if not raw_line or not raw_line.strip():
++                continue
++            try:
++                payload = json.loads(raw_line)
++            except json.JSONDecodeError:
++                logger.debug("Ignoring non-JSON Claude stdout line")
++                continue
++            if not isinstance(payload, dict):
++                continue
++
++            payload_type = payload.get("type")
++            if payload.get("session_id"):
++                result.session_id = str(payload["session_id"])
++
++            if payload_type == "stream_event":
++                event = payload.get("event") or {}
++                if not isinstance(event, dict):
++                    continue
++                event_type = event.get("type")
++                if event_type == "content_block_start":
++                    index = int(event.get("index") or 0)
++                    block = event.get("content_block") or {}
++                    if isinstance(block, dict) and block.get("type") == "tool_use":
++                        name = str(block.get("name") or "ClaudeTool")
++                        tool_id = str(block.get("id") or "")
++                        result.side_effects_possible = True
++                        if tool_id:
++                            projector._tool_names[tool_id] = name
++                        if self.on_tool_started is not None:
++                            self.on_tool_started(name, block.get("input") or {})
++                elif event_type == "content_block_delta":
++                    delta = event.get("delta") or {}
++                    if not isinstance(delta, dict):
++                        continue
++                    if delta.get("type") == "text_delta":
++                        text = delta.get("text") or ""
++                        if text and self.on_text_delta is not None:
++                            self.on_text_delta(text)
++                    elif delta.get("type") == "thinking_delta":
++                        thinking = delta.get("thinking") or ""
++                        if thinking and self.on_reasoning_delta is not None:
++                            self.on_reasoning_delta(thinking)
++                continue
++
++            if payload_type == "tool_progress":
++                if self.on_status is not None:
++                    name = str(payload.get("tool_name") or "tool")
++                    elapsed = payload.get("elapsed_time_seconds")
++                    suffix = (
++                        f" ({float(elapsed):.0f}s)"
++                        if isinstance(elapsed, (int, float))
++                        else ""
++                    )
++                    self.on_status(f"Claude {name} running{suffix}")
++                continue
++
++            if payload_type in {"assistant", "user"}:
++                projected, completed = projector.project(payload)
++                if projected:
++                    result.projected_messages.extend(projected)
++                result.tool_iterations += completed
++                if payload_type == "user" and completed and self.on_tool_completed:
++                    for message in projected:
++                        self.on_tool_completed(str(message.get("name") or "ClaudeTool"))
++                continue
++
++            if payload_type == "system" and payload.get("subtype") == "api_retry":
++                if self.on_status is not None:
++                    attempt = payload.get("attempt")
++                    maximum = payload.get("max_retries")
++                    category = payload.get("error") or "provider error"
++                    self.on_status(f"Claude retry {attempt}/{maximum}: {category}")
++                continue
++
++            if payload_type == "result":
++                saw_result = True
++                result.final_text = str(payload.get("result") or "")
++                usage = payload.get("usage") or {}
++                if isinstance(usage, dict):
++                    result.token_usage = usage
++                subtype = str(payload.get("subtype") or "")
++                if payload.get("is_error") or (subtype and subtype != "success"):
++                    result.error = result.final_text or f"Claude Code ended with {subtype}"
++                    result.status_code = int(
++                        payload.get("api_error_status")
++                        or _status_for_error(f"{subtype} {result.error}")
++                    )
++
++        try:
++            return_code = proc.wait(timeout=5)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            return_code = proc.wait(timeout=5)
++            result.should_retire = True
++        finally:
++            with self._lock:
++                if self._active_process is proc:
++                    self._active_process = None
++
++        stderr_text = "\n".join(stderr_tail).strip()
++        if self._interrupt_event.is_set() and result.error is None:
++            result.interrupted = True
++        elif return_code != 0 and result.error is None:
++            safe_error = redact_sensitive_text(
++                stderr_text or "Claude Code exited without a result", force=True
++            )
++            result.error = safe_error[-4000:]
++            result.status_code = _status_for_error(result.error)
++            result.should_retire = True
++        elif not saw_result and result.error is None:
++            result.error = "Claude Code stream ended without a result message"
++            result.status_code = 500
++            result.should_retire = True
++
++        return result
++
++
++__all__ = [
++    "ClaudeCodeSession",
++    "ClaudeEventProjector",
++    "ClaudeTurnResult",
++    "build_turn_prompt",
++]
+diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
+index 37f2d61..fab294b 100644
+--- a/agent/transports/hermes_tools_mcp_server.py
++++ b/agent/transports/hermes_tools_mcp_server.py
+@@ -1,15 +1,13 @@
+-"""Hermes-tools-as-MCP server for the codex_app_server runtime.
++"""Hermes-tools-as-MCP server for external agent runtimes.
+ 
+-When the user runs `openai/*` turns through the codex app-server, codex
+-owns the loop and builds its own tool list. By default, that means
+-Hermes' richer tool surface — web search, browser automation,
+-delegate_task subagents, vision analysis, persistent memory, skills,
+-cross-session search, image generation, TTS — is unreachable.
++When Codex app-server or Claude Code owns the loop, it builds its own tool
++list. By default, that means
++Hermes' richer tool surface — web search, browser automation, vision analysis,
++persistent memory, skills, cross-session search, image generation, TTS — is
++unreachable.
+ 
+-This module exposes a curated subset of those Hermes tools to the
+-spawned codex subprocess via stdio MCP. Codex registers it as a normal
+-MCP server (per `~/.codex/config.toml [mcp_servers.hermes-tools]`) and
+-the user gets full Hermes capability inside a Codex turn.
++This module exposes enabled, stateless Hermes tools to the external runtime via
++stdio MCP. The user keeps the profile's Hermes capability inside that turn.
+ 
+ Scope (what we expose):
+   - web_search, web_extract              — Firecrawl, no codex equivalent
+@@ -18,7 +16,8 @@ Scope (what we expose):
+     _get_images / _console / _vision
+   - vision_analyze                       — image inspection by vision model
+   - image_generate                       — image generation
+-  - skill_view, skills_list              — Hermes' skill library
++  - skill_view/list/manage               — Hermes' skill library
++  - memory, session_search               — profile memory and transcript DB
+   - text_to_speech                       — TTS
+   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
+     heartbeat/show/list/create/            handoff (stateless: read env var,
+@@ -28,23 +27,23 @@ What we DO NOT expose:
+   - terminal / shell                     — codex's own shell tool
+   - read_file / write_file / patch       — codex's apply_patch + shell
+   - search_files / process               — codex's shell
+-  - clarify                              — codex's own UX
+-  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
+-    session_search / todo                  (model_tools.py). They require
+-                                           the running AIAgent context to
+-                                           dispatch (mid-loop state), so a
+-                                           stateless MCP callback can't
+-                                           drive them. See the inline
+-                                           comment on EXPOSED_TOOLS below.
++  - clarify                              — needs the live Hermes UI callback
++  - delegate_task                        — external runtimes own subagents
++  - todo                                 — external runtimes own turn planning
++
++Configured external MCP servers are discovered inside this subprocess and
++re-exported too. This keeps profile-specific GitHub/wiki/etc. tools available
++without copying their credentials into the external agent's command line.
+ 
+ Run with: python -m agent.transports.hermes_tools_mcp_server
+-Spawned by: CodexAppServerSession.ensure_started() when the runtime is
+-            active and config opts in.
++Spawned by: CodexAppServerSession or ClaudeCodeSession.
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
++import inspect
++import keyword
+ import logging
+ import os
+ import sys
+@@ -60,11 +59,8 @@ logger = logging.getLogger(__name__)
+ #   - terminal / shell / read_file / write_file / patch / search_files /
+ #     process — codex's built-ins cover these and approval routes through
+ #     codex's own UI.
+-#   - delegate_task / memory / session_search / todo — these are
+-#     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
+-#     the running AIAgent context to dispatch (mid-loop state), so a
+-#     stateless MCP callback can't drive them. Hermes' default runtime
+-#     keeps these working; the codex_app_server runtime cannot.
++#   - delegate_task / todo / clarify — they require live AIAgent/UI state;
++#     external runtimes have native agent/planning UX.
+ EXPOSED_TOOLS: tuple[str, ...] = (
+     "web_search",
+     "web_extract",
+@@ -82,6 +78,10 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+     "image_generate",
+     "skill_view",
+     "skills_list",
++    "skill_manage",
++    "memory",
++    "session_search",
++    "cronjob",
+     "text_to_speech",
+     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
+     # (set by the kanban dispatcher when spawning a worker). Without these
+@@ -105,6 +105,65 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+ )
+ 
+ 
++_EXCLUDED_CONTEXT_OR_NATIVE_TOOLS = {
++    "terminal",
++    "shell",
++    "process",
++    "read_file",
++    "write_file",
++    "patch",
++    "search_files",
++    "execute_code",
++    "read_terminal",
++    "close_terminal",
++    "clarify",
++    "delegate_task",
++    "todo",
++}
++
++
++def _toolsets_from_env(name: str) -> Optional[list[str]]:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return None
++    try:
++        parsed = json.loads(raw)
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(parsed, list):
++        return None
++    return [str(item) for item in parsed if str(item).strip()]
++
++
++def _apply_json_schema_signature(fn: Any, schema: dict[str, Any]) -> None:
++    """Give FastMCP an explicit callable signature for a JSON-schema tool.
++
++    FastMCP otherwise models ``def tool(**kwargs)`` as one required argument
++    literally named ``kwargs``. The displayed schema is replaced with Hermes'
++    authoritative schema after registration; this signature supplies the
++    permissive per-field validation model used when FastMCP invokes the fn.
++    """
++    properties = schema.get("properties") or {}
++    if not isinstance(properties, dict):
++        properties = {}
++    required = set(schema.get("required") or [])
++    parameters = []
++    for name in properties:
++        if not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name):
++            logger.warning("cannot expose MCP parameter with invalid Python name: %r", name)
++            continue
++        default = inspect.Parameter.empty if name in required else None
++        parameters.append(
++            inspect.Parameter(
++                name,
++                inspect.Parameter.KEYWORD_ONLY,
++                default=default,
++                annotation=Any,
++            )
++        )
++    fn.__signature__ = inspect.Signature(parameters=parameters)
++
++
+ def _build_server() -> Any:
+     """Create the FastMCP server with Hermes tools attached. Lazy imports
+     so the module can be imported without the mcp package installed
+@@ -116,7 +175,18 @@ def _build_server() -> Any:
+             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
+         ) from exc
+ 
+-    # Discover Hermes tools so dispatch works.
++    # Discover Hermes tools so dispatch works. External MCP discovery must run
++    # in this subprocess too: the parent registry is process-local. Interactive
++    # OAuth is suppressed because stdin/stdout belong to the MCP protocol.
++    try:
++        from hermes_cli.mcp_startup import (
++            _discover_mcp_tools_without_interactive_oauth,
++        )
++
++        _discover_mcp_tools_without_interactive_oauth()
++    except Exception:
++        logger.debug("profile MCP discovery failed", exc_info=True)
++
+     from model_tools import (
+         get_tool_definitions,
+         handle_function_call,
+@@ -125,10 +195,10 @@ def _build_server() -> Any:
+     mcp = FastMCP(
+         "hermes-tools",
+         instructions=(
+-            "Hermes Agent's tool surface, exposed for use inside a Codex "
+-            "session. Use these for capabilities Codex's built-in toolset "
++            "Hermes Agent's tool surface, exposed for an external agent "
++            "session. Use these for capabilities its built-in toolset "
+             "doesn't cover: web search/extract, browser automation, "
+-            "subagent delegation, vision, image generation, persistent "
++            "vision, image generation, persistent "
+             "memory, skills, and cross-session search."
+         ),
+     )
+@@ -137,13 +207,34 @@ def _build_server() -> Any:
+     # MCP clients see the same parameter docs Hermes gives the model.
+     all_defs = {
+         td["function"]["name"]: td["function"]
+-        for td in (get_tool_definitions(quiet_mode=True) or [])
++        for td in (
++            get_tool_definitions(
++                enabled_toolsets=_toolsets_from_env(
++                    "HERMES_EXTERNAL_ENABLED_TOOLSETS"
++                ),
++                disabled_toolsets=_toolsets_from_env(
++                    "HERMES_EXTERNAL_DISABLED_TOOLSETS"
++                ),
++                quiet_mode=True,
++                skip_tool_search_assembly=True,
++            )
++            or []
++        )
+         if isinstance(td, dict) and td.get("type") == "function"
+     }
+ 
++    stateless_tools = {
++        name for name in all_defs if name not in _EXCLUDED_CONTEXT_OR_NATIVE_TOOLS
++    }
++    exposed_tools = tuple(
++        dict.fromkeys((*EXPOSED_TOOLS, *sorted(stateless_tools)))
++    )
++
++    memory_store = None
++
+     exposed_count = 0
+ 
+-    for name in EXPOSED_TOOLS:
++    for name in exposed_tools:
+         spec = all_defs.get(name)
+         if spec is None:
+             logger.debug(
+@@ -159,20 +250,33 @@ def _build_server() -> Any:
+         # the result string. We use add_tool() for full control over the
+         # input schema (FastMCP's @tool() decorator inspects type hints,
+         # which we can't get from a JSON schema at runtime).
+-        def _make_handler(tool_name: str):
++        def _make_handler(tool_name: str, tool_description: str):
+             def _dispatch(**kwargs: Any) -> str:
++                nonlocal memory_store
+                 try:
++                    if tool_name == "session_search":
++                        from tools.session_search_tool import session_search
++
++                        return session_search(**(kwargs or {}))
++                    if tool_name == "memory":
++                        from tools.memory_tool import MemoryStore, memory_tool
++
++                        if memory_store is None:
++                            memory_store = MemoryStore()
++                            memory_store.load_from_disk()
++                        return memory_tool(store=memory_store, **(kwargs or {}))
+                     return handle_function_call(tool_name, kwargs or {})
+                 except Exception as exc:
+                     logger.exception("tool %s raised", tool_name)
+                     return json.dumps({"error": str(exc), "tool": tool_name})
+             _dispatch.__name__ = tool_name
+-            _dispatch.__doc__ = description
++            _dispatch.__doc__ = tool_description
++            _apply_json_schema_signature(_dispatch, params_schema)
+             return _dispatch
+ 
+         try:
+             mcp.add_tool(
+-                _make_handler(name),
++                _make_handler(name, description),
+                 name=name,
+                 description=description,
+                 # FastMCP accepts JSON schema directly via the
+@@ -181,15 +285,23 @@ def _build_server() -> Any:
+             )
+         except TypeError:
+             # Older mcp SDK signature — fall back to decorator-style.
+-            handler = _make_handler(name)
++            handler = _make_handler(name, description)
+             handler = mcp.tool(name=name, description=description)(handler)
+ 
++        # Current FastMCP has no public custom-input-schema parameter. Its
++        # invocation model comes from the explicit signature above; replace
++        # only the client-visible schema with Hermes' authoritative one.
++        manager = getattr(mcp, "_tool_manager", None)
++        registered = manager.get_tool(name) if manager is not None else None
++        if registered is not None:
++            registered.parameters = params_schema
++
+         exposed_count += 1
+ 
+     logger.info(
+         "hermes-tools MCP server registered %d/%d tools",
+         exposed_count,
+-        len(EXPOSED_TOOLS),
++        len(exposed_tools),
+     )
+     return mcp
+ 
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index eb1c68f..3dd76a2 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -15,6 +15,7 @@ import logging
+ import os
+ import sqlite3
+ import time
++from dataclasses import replace
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+ 
+@@ -493,8 +494,8 @@ class GatewayKanbanWatchersMixin:
+                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                         if _wake_kinds:
+                             try:
+-                                _session_key = getattr(task, "session_id", None) or ""
+-                                if _session_key:
++                                _origin_session_id = getattr(task, "session_id", None) or ""
++                                if _origin_session_id:
+                                     _title = (task.title if task else sub["task_id"])[:120]
+                                     _assignee = task.assignee if task else ""
+                                     _parts = []
+@@ -512,44 +513,64 @@ class GatewayKanbanWatchersMixin:
+                                         assignee=_assignee,
+                                         board=board_slug,
+                                     )
+-                                    from gateway.session import SessionSource
+                                     from gateway.platforms.base import MessageEvent, MessageType
+-                                    # KNOWN LIMITATION (tracked follow-up): the
+-                                    # subscription row does not persist the
+-                                    # creator's chat_type, and it is not carried
+-                                    # on the session-context bridge, so we cannot
+-                                    # faithfully reconstruct the creator's real
+-                                    # session key here. build_session_key() keys
+-                                    # DMs (":dm:<chat_id>") on a wholly different
+-                                    # shape from group/thread, so any hardcoded
+-                                    # value mis-routes some creators. "group" is
+-                                    # the least-surprising default for the
+-                                    # dashboard/group flows this wake primarily
+-                                    # serves; DM-originated creators are handled
+-                                    # by the follow-up that stamps + persists
+-                                    # chat_type end-to-end. handle_message()
+-                                    # get_or_create_session's the target, so a
+-                                    # mismatch degrades to "wake lands in a fresh
+-                                    # group session" — never an exception.
+-                                    _source = SessionSource(
+-                                        platform=plat,
+-                                        chat_id=sub["chat_id"],
+-                                        chat_type="group",
+-                                        thread_id=sub.get("thread_id") or None,
+-                                        user_id=sub.get("user_id"),
+-                                        profile=sub_profile or None,
+-                                    )
+-                                    _synth_event = MessageEvent(
+-                                        text=_synth,
+-                                        message_type=MessageType.TEXT,
+-                                        source=_source,
+-                                        internal=True,
++                                    # The task stores the durable gateway
++                                    # session id, so recover its exact source
++                                    # instead of guessing chat_type. Guessing
++                                    # "group" creates a fresh session for DM
++                                    # creators: the human sees the notification,
++                                    # but the waiting agent never receives the
++                                    # internal completion event.
++                                    _origin = self._gateway_session_origin_for_id(
++                                        _origin_session_id
+                                     )
+-                                    await adapter.handle_message(_synth_event)
+-                                    logger.info(
+-                                        "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
+-                                        sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
++                                    _same_destination = (
++                                        _origin is not None
++                                        and _origin.platform == plat
++                                        and str(_origin.chat_id or "")
++                                        == str(sub["chat_id"] or "")
++                                        and str(_origin.thread_id or "")
++                                        == str(sub.get("thread_id") or "")
++                                        and (
++                                            not sub.get("user_id")
++                                            or str(_origin.user_id or "")
++                                            == str(sub.get("user_id") or "")
++                                        )
++                                        and (
++                                            not sub_profile
++                                            or not (_origin.profile or "")
++                                            or _origin.profile == sub_profile
++                                        )
+                                     )
++                                    if not _same_destination:
++                                        logger.warning(
++                                            "kanban notifier: refusing wake for %s; "
++                                            "session %s has no matching stored origin",
++                                            sub["task_id"], _origin_session_id,
++                                        )
++                                    else:
++                                        # Avoid replying to the original user
++                                        # message while retaining every routing
++                                        # discriminator (DM/group/thread,
++                                        # participant, scope, profile).
++                                        _source = replace(
++                                            _origin,
++                                            message_id=None,
++                                            profile=sub_profile or _origin.profile,
++                                        )
++                                        _synth_event = MessageEvent(
++                                            text=_synth,
++                                            message_type=MessageType.TEXT,
++                                            source=_source,
++                                            internal=True,
++                                        )
++                                        await adapter.handle_message(_synth_event)
++                                        logger.info(
++                                            "kanban notifier: woke agent for %s on %s/%s profile=%s session=%s events=%s",
++                                            sub["task_id"], platform_str, sub["chat_id"],
++                                            sub_profile or "default", _origin_session_id,
++                                            _wake_kinds,
++                                        )
+                             except Exception as _wk_err:
+                                 # Best-effort: the notification itself already
+                                 # delivered and the cursor has advanced, so a
+diff --git a/gateway/run.py b/gateway/run.py
+index d5b3fbf..8494d8a 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -15087,6 +15087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             user_id=str(context.source.user_id) if context.source.user_id else "",
+             user_name=str(context.source.user_name) if context.source.user_name else "",
+             session_key=context.session_key,
++            session_id=context.session_id,
+             message_id=str(context.source.message_id) if context.source.message_id else "",
+             profile=getattr(context.source, "profile", "") or "",
+             async_delivery=_async_delivery,
 diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
-index a3a26b2..b6488ba 100644
+index a3a26b2..64b2ad8 100644
 --- a/hermes_cli/runtime_provider.py
 +++ b/hermes_cli/runtime_provider.py
-@@ -433,14 +433,15 @@ def _resolve_runtime_from_pool_entry(
+@@ -340,6 +340,10 @@ _VALID_API_MODES = {
+     "codex_responses",
+     "anthropic_messages",
+     "bedrock_converse",
++    # Official Claude Code owns the complete agent/tool loop and streams its
++    # events back to Hermes.  Distinct from anthropic_messages so Hermes never
++    # executes Claude's native Bash/Edit calls a second time.
++    "claude_code",
+     # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
+     # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
+     # instead of Hermes' tool dispatch. Gated behind config key
+@@ -433,14 +437,35 @@ def _resolve_runtime_from_pool_entry(
          pconfig = PROVIDER_REGISTRY.get(provider)
          base_url = base_url or (pconfig.inference_base_url if pconfig else "")
      elif provider == "anthropic":
 -        api_mode = "anthropic_messages"
-+        use_claude_cli = str(model_cfg.get("anthropic_runtime") or "").strip().lower() == "claude_code_cli"
-+        api_mode = "chat_completions" if use_claude_cli else "anthropic_messages"
++        configured_runtime = str(
++            os.environ.get("HERMES_ANTHROPIC_RUNTIME")
++            or model_cfg.get("anthropic_runtime")
++            or ""
++        ).strip().lower()
++        # Claude Code sourced credentials should use the official agent runtime
++        # by default.  API-key rows have no claude_config_dir and retain the
++        # native Messages API.  Explicit native/messages values remain an
++        # escape hatch; the old claude_code_cli spelling upgrades in place.
++        force_native = configured_runtime in {
++            "anthropic_messages",
++            "messages",
++            "native",
++            "api",
++            "off",
++        }
++        use_claude_agent = (
++            configured_runtime
++            in {"claude_code", "claude_code_cli", "claude_agent_sdk", "agent"}
++            or (not configured_runtime and bool(getattr(entry, "claude_config_dir", None)))
++        ) and not force_native
++        api_mode = "claude_code" if use_claude_agent else "anthropic_messages"
          cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
          cfg_base_url = ""
          if cfg_provider == "anthropic":
@@ -913,15 +2148,69 @@ index a3a26b2..b6488ba 100644
              if not _anthropic_base_url_override_ok(cfg_base_url):
                  cfg_base_url = ""
 -        base_url = cfg_base_url or base_url or "https://api.anthropic.com"
-+        base_url = "acp://claude-code" if use_claude_cli else (cfg_base_url or base_url or "https://api.anthropic.com")
++        base_url = "acp://claude-code" if use_claude_agent else (cfg_base_url or base_url or "https://api.anthropic.com")
      elif provider == "openrouter":
          base_url = base_url or OPENROUTER_BASE_URL
      elif provider == "xai":
 diff --git a/run_agent.py b/run_agent.py
-index fe378f3..daadf5e 100644
+index fe378f3..1913c42 100644
 --- a/run_agent.py
 +++ b/run_agent.py
-@@ -4540,6 +4540,10 @@ class AIAgent:
+@@ -2674,6 +2674,19 @@ class AIAgent:
+         """
+         self._interrupt_requested = True
+         self._interrupt_message = message
++        # External agent runtimes own their subprocess/tool loop.  Signal them
++        # directly so a blocked stdout read or long Bash command stops now.
++        for _session_attr in ("_claude_code_session", "_codex_session"):
++            _external_session = getattr(self, _session_attr, None)
++            if _external_session is not None:
++                try:
++                    _external_session.request_interrupt()
++                except Exception:
++                    logger.debug(
++                        "Failed to interrupt external runtime %s",
++                        _session_attr,
++                        exc_info=True,
++                    )
+         # A cron turn performs its API request on the conversation thread to
+         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
+         # path, its client is registered here so this cross-thread interrupt can
+@@ -3487,6 +3500,16 @@ class AIAgent:
+         """
+         task_id = getattr(self, "session_id", None) or ""
+ 
++        # External runtime subprocesses are not owned by the OpenAI client.
++        for _session_attr in ("_claude_code_session", "_codex_session"):
++            _external_session = getattr(self, _session_attr, None)
++            if _external_session is not None:
++                try:
++                    _external_session.close()
++                except Exception:
++                    pass
++                setattr(self, _session_attr, None)
++
+         # 1. Kill background processes for this task
+         try:
+             from tools.process_registry import process_registry
+@@ -4517,6 +4540,16 @@ class AIAgent:
+         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+ 
++        if self.api_mode == "claude_code":
++            self.api_key = runtime_key
++            self.base_url = "acp://claude-code"
++            self._client_kwargs["api_key"] = runtime_key
++            self._client_kwargs["base_url"] = self.base_url
++            config_dir = getattr(entry, "claude_config_dir", None)
++            if config_dir:
++                self._client_kwargs["claude_config_dir"] = config_dir
++            return
++
+         if self.api_mode == "anthropic_messages":
+             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+ 
+@@ -4540,6 +4573,10 @@ class AIAgent:
          self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
          self._client_kwargs["api_key"] = self.api_key
          self._client_kwargs["base_url"] = self.base_url
@@ -932,8 +2221,38 @@ index fe378f3..daadf5e 100644
          self._apply_client_headers_for_base_url(self.base_url)
          self._replace_primary_openai_client(reason="credential_rotation")
  
+@@ -5836,6 +5873,29 @@ class AIAgent:
+         from agent.codex_runtime import run_codex_app_server_turn
+         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+ 
++    def _run_claude_code_turn(
++        self,
++        *,
++        user_message: str,
++        original_user_message: Any,
++        messages: List[Dict[str, Any]],
++        active_system_prompt: str,
++        effective_task_id: str,
++        should_review_memory: bool = False,
++    ) -> Dict[str, Any]:
++        """Forwarder for the external Claude Code agent runtime."""
++        from agent.claude_runtime import run_claude_code_turn
++
++        return run_claude_code_turn(
++            self,
++            user_message=user_message,
++            original_user_message=original_user_message,
++            messages=messages,
++            active_system_prompt=active_system_prompt,
++            effective_task_id=effective_task_id,
++            should_review_memory=should_review_memory,
++        )
++
+ def main(
+     query: str = None,
+     model: str = "",
 diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
-index febdf53..e2b1594 100644
+index febdf53..4454af8 100644
 --- a/tests/agent/test_anthropic_adapter.py
 +++ b/tests/agent/test_anthropic_adapter.py
 @@ -229,7 +229,7 @@ class TestReadClaudeCodeCredentials:
@@ -1003,7 +2322,22 @@ index febdf53..e2b1594 100644
      @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
      def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):
          """Refreshed Claude Code credentials must land on disk at 0o600.
-@@ -658,6 +695,13 @@ class TestResolveWithRefresh:
+@@ -611,6 +648,14 @@ class TestWriteClaudeCodeCredentials:
+ 
+ 
+ class TestResolveWithRefresh:
++    @pytest.fixture(autouse=True)
++    def no_host_keychain(self, monkeypatch):
++        """Credential refresh tests must never consult the operator Keychain."""
++        monkeypatch.setattr(
++            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
++            lambda *args, **kwargs: None,
++        )
++
+     def test_auto_refresh_on_expired_creds(self, monkeypatch, tmp_path):
+         """When cred file has expired token + refresh token, auto-refresh is attempted."""
+         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+@@ -658,6 +703,13 @@ class TestResolveWithRefresh:
  
  
  class TestRunOauthSetupToken:
@@ -1092,80 +2426,6 @@ index 97faca0..dc3d945 100644
          # Prefers the live source's refresh token over the caller's stale copy.
          assert captured["refresh_token"] == "live-refresh"
 -
-diff --git a/tests/agent/test_claude_code_cli_client.py b/tests/agent/test_claude_code_cli_client.py
-new file mode 100644
-index 0000000..359022d
---- /dev/null
-+++ b/tests/agent/test_claude_code_cli_client.py
-@@ -0,0 +1,68 @@
-+import json
-+
-+import pytest
-+
-+from agent.claude_code_cli_client import (
-+    CLAUDE_CODE_MARKER_BASE_URL,
-+    ClaudeCodeCLIClient,
-+    ClaudeCodeCLIError,
-+)
-+
-+
-+class _FakeProcess:
-+    def __init__(self, stdout: str, returncode: int = 0):
-+        self._stdout = stdout
-+        self.returncode = returncode
-+
-+    def communicate(self, timeout=None):
-+        return self._stdout, ""
-+
-+    def poll(self):
-+        return self.returncode
-+
-+    def terminate(self):
-+        self.returncode = -15
-+
-+
-+def test_cli_client_uses_config_dir_and_strips_direct_auth(monkeypatch, tmp_path):
-+    captured = {}
-+    payload = {"is_error": False, "result": "OK", "usage": {"input_tokens": 2, "output_tokens": 1}}
-+
-+    def fake_popen(args, **kwargs):
-+        captured.update(args=args, **kwargs)
-+        return _FakeProcess(json.dumps(payload))
-+
-+    monkeypatch.setattr("agent.claude_code_cli_client.shutil.which", lambda _: "/usr/bin/claude")
-+    monkeypatch.setattr("agent.claude_code_cli_client.subprocess.Popen", fake_popen)
-+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-pass")
-+
-+    client = ClaudeCodeCLIClient(
-+        base_url=CLAUDE_CODE_MARKER_BASE_URL,
-+        claude_config_dir=str(tmp_path),
-+    )
-+    response = client.chat.completions.create(
-+        model="claude-opus-4-8",
-+        messages=[{"role": "user", "content": "OK"}],
-+    )
-+
-+    assert response.choices[0].message.content == "OK"
-+    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path.resolve())
-+    assert "ANTHROPIC_API_KEY" not in captured["env"]
-+
-+
-+def test_cli_client_maps_usage_limit_to_429(monkeypatch, tmp_path):
-+    payload = {"is_error": True, "result": "You've hit your usage limit", "api_error_status": 429}
-+    monkeypatch.setattr("agent.claude_code_cli_client.shutil.which", lambda _: "/usr/bin/claude")
-+    monkeypatch.setattr(
-+        "agent.claude_code_cli_client.subprocess.Popen",
-+        lambda *args, **kwargs: _FakeProcess(json.dumps(payload), returncode=1),
-+    )
-+    client = ClaudeCodeCLIClient(claude_config_dir=str(tmp_path))
-+
-+    with pytest.raises(ClaudeCodeCLIError) as exc:
-+        client.chat.completions.create(
-+            model="claude-opus-4-8",
-+            messages=[{"role": "user", "content": "hello"}],
-+        )
-+
-+    assert exc.value.status_code == 429
 diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
 index 68a9233..c2d2ec6 100644
 --- a/tests/agent/test_credential_pool.py
@@ -1353,6 +2613,629 @@ index 9c7c047..d1c99d9 100644
  
      def test_second_429_rotates_to_next(self):
          """Second consecutive 429 should rotate to next credential."""
+diff --git a/tests/agent/transports/test_claude_code_session.py b/tests/agent/transports/test_claude_code_session.py
+new file mode 100644
+index 0000000..f0298cc
+--- /dev/null
++++ b/tests/agent/transports/test_claude_code_session.py
+@@ -0,0 +1,300 @@
++from __future__ import annotations
++
++import json
++
++from agent.transports.claude_code_session import (
++    ClaudeCodeSession,
++    ClaudeEventProjector,
++    build_turn_prompt,
++)
++
++
++def _line(payload):
++    return json.dumps(payload) + "\n"
++
++
++class _FakeInput:
++    def __init__(self):
++        self.value = ""
++        self.closed = False
++
++    def write(self, value):
++        self.value += value
++
++    def close(self):
++        self.closed = True
++
++
++class _FakeProcess:
++    def __init__(self, stdout_lines, *, stderr_lines=(), returncode=0):
++        self.stdin = _FakeInput()
++        self.stdout = list(stdout_lines)
++        self.stderr = list(stderr_lines)
++        self.returncode = returncode
++        self.terminated = False
++        self.killed = False
++
++    def poll(self):
++        return self.returncode
++
++    def wait(self, timeout=None):
++        return self.returncode
++
++    def terminate(self):
++        self.terminated = True
++        self.returncode = -15
++
++    def kill(self):
++        self.killed = True
++        self.returncode = -9
++
++
++def test_streams_text_and_projects_native_tool_history(monkeypatch, tmp_path):
++    events = [
++        {"type": "system", "subtype": "init", "session_id": "sess-1"},
++        {
++            "type": "stream_event",
++            "event": {
++                "type": "content_block_delta",
++                "index": 0,
++                "delta": {"type": "text_delta", "text": "Working"},
++            },
++        },
++        {
++            "type": "stream_event",
++            "event": {
++                "type": "content_block_start",
++                "index": 1,
++                "content_block": {
++                    "type": "tool_use",
++                    "id": "tool-1",
++                    "name": "Bash",
++                    "input": {"command": "printf ok"},
++                },
++            },
++        },
++        {
++            "type": "assistant",
++            "message": {
++                "content": [
++                    {"type": "text", "text": "Working"},
++                    {
++                        "type": "tool_use",
++                        "id": "tool-1",
++                        "name": "Bash",
++                        "input": {"command": "printf ok"},
++                    },
++                ]
++            },
++        },
++        {
++            "type": "user",
++            "message": {
++                "content": [
++                    {
++                        "type": "tool_result",
++                        "tool_use_id": "tool-1",
++                        "content": "ok",
++                    }
++                ]
++            },
++        },
++        {
++            "type": "stream_event",
++            "event": {
++                "type": "content_block_delta",
++                "index": 0,
++                "delta": {"type": "text_delta", "text": "Done"},
++            },
++        },
++        {
++            "type": "assistant",
++            "message": {"content": [{"type": "text", "text": "Done"}]},
++        },
++        {
++            "type": "result",
++            "subtype": "success",
++            "result": "Done",
++            "session_id": "sess-1",
++            "usage": {"input_tokens": 7, "output_tokens": 2},
++        },
++    ]
++    process = _FakeProcess([_line(event) for event in events])
++    captured = {}
++
++    def fake_popen(args, **kwargs):
++        captured.update(args=args, **kwargs)
++        return process
++
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.shutil.which",
++        lambda _: "/usr/bin/claude",
++    )
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.subprocess.Popen", fake_popen
++    )
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-pass")
++    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://must-not-pass.invalid")
++    text_deltas = []
++    tool_starts = []
++    tool_completions = []
++    session = ClaudeCodeSession(
++        claude_config_dir=str(tmp_path / "claude-account"),
++        cwd=str(tmp_path),
++        model="claude-test",
++        expose_hermes_tools=False,
++        on_text_delta=text_deltas.append,
++        on_tool_started=lambda name, args: tool_starts.append((name, args)),
++        on_tool_completed=tool_completions.append,
++    )
++
++    result = session.run_turn(prompt="private prompt")
++
++    assert result.error is None
++    assert result.final_text == "Done"
++    assert result.session_id == "sess-1"
++    assert result.token_usage == {"input_tokens": 7, "output_tokens": 2}
++    assert result.tool_iterations == 1
++    assert text_deltas == ["Working", "Done"]
++    assert tool_starts == [("Bash", {"command": "printf ok"})]
++    assert tool_completions == ["Bash"]
++    assert [message["role"] for message in result.projected_messages] == [
++        "assistant",
++        "tool",
++        "assistant",
++    ]
++    assert result.projected_messages[0]["tool_calls"][0]["function"]["name"] == "Bash"
++    assert result.projected_messages[1]["tool_call_id"] == "tool-1"
++    assert result.projected_messages[1]["tool_name"] == "Bash"
++    assert result.side_effects_possible is True
++
++    args = captured["args"]
++    assert "stream-json" in args
++    assert "--include-partial-messages" in args
++    assert "--no-session-persistence" in args
++    assert args[args.index("--permission-mode") + 1] == "auto"
++    assert args[args.index("--tools") + 1] == "default"
++    assert "private prompt" not in args
++    assert process.stdin.value == "private prompt"
++    assert process.stdin.closed is True
++    assert captured["cwd"] == str(tmp_path.resolve())
++    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(
++        (tmp_path / "claude-account").resolve()
++    )
++    assert "ANTHROPIC_API_KEY" not in captured["env"]
++    assert "ANTHROPIC_BASE_URL" not in captured["env"]
++
++
++def test_result_usage_limit_maps_to_429(monkeypatch, tmp_path):
++    process = _FakeProcess(
++        [
++            _line(
++                {
++                    "type": "result",
++                    "subtype": "error_during_execution",
++                    "is_error": True,
++                    "result": "You've hit your usage limit",
++                }
++            )
++        ],
++        returncode=1,
++    )
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.shutil.which",
++        lambda _: "/usr/bin/claude",
++    )
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.subprocess.Popen",
++        lambda *args, **kwargs: process,
++    )
++    session = ClaudeCodeSession(
++        claude_config_dir=str(tmp_path / "claude-account"),
++        cwd=str(tmp_path),
++        model="claude-test",
++        expose_hermes_tools=False,
++    )
++
++    result = session.run_turn(prompt="hello")
++
++    assert result.status_code == 429
++    assert "usage limit" in result.error
++
++
++def test_projector_keeps_tool_results_as_history_only():
++    projector = ClaudeEventProjector()
++    assistant, _ = projector.project(
++        {
++            "type": "assistant",
++            "message": {
++                "content": [
++                    {
++                        "type": "tool_use",
++                        "id": "tool-1",
++                        "name": "Edit",
++                        "input": {"file_path": "example.py"},
++                    }
++                ]
++            },
++        }
++    )
++    user, completed = projector.project(
++        {
++            "type": "user",
++            "message": {
++                "content": [
++                    {
++                        "type": "tool_result",
++                        "tool_use_id": "tool-1",
++                        "content": "edited",
++                    }
++                ]
++            },
++        }
++    )
++
++    assert assistant[0]["tool_calls"][0]["function"]["name"] == "Edit"
++    assert user == [
++        {
++            "role": "tool",
++            "name": "Edit",
++            "tool_name": "Edit",
++            "tool_call_id": "tool-1",
++            "content": "edited",
++        }
++    ]
++    assert completed == 1
++
++
++def test_turn_prompt_uses_bounded_role_labelled_transcript():
++    prompt = build_turn_prompt(
++        system_prompt="system rules",
++        messages=[
++            {"role": "user", "content": "hello"},
++            {"role": "assistant", "content": "world"},
++        ],
++    )
++
++    assert "HERMES SYSTEM INSTRUCTIONS:\nsystem rules" in prompt
++    assert "USER:\nhello" in prompt
++    assert "ASSISTANT:\nworld" in prompt
++
++
++def test_mcp_server_receives_exact_profile_toolset_scope(tmp_path):
++    session = ClaudeCodeSession(
++        claude_config_dir=str(tmp_path / "claude-account"),
++        cwd=str(tmp_path),
++        model="claude-test",
++        enabled_toolsets=["kanban", "memory"],
++        disabled_toolsets=["browser"],
++    )
++
++    config = json.loads(session._hermes_mcp_config())
++    server_env = config["mcpServers"]["hermes-tools"]["env"]
++
++    assert json.loads(server_env["HERMES_EXTERNAL_ENABLED_TOOLSETS"]) == [
++        "kanban",
++        "memory",
++    ]
++    assert json.loads(server_env["HERMES_EXTERNAL_DISABLED_TOOLSETS"]) == [
++        "browser"
++    ]
+diff --git a/tests/agent/transports/test_hermes_tools_mcp_server.py b/tests/agent/transports/test_hermes_tools_mcp_server.py
+index c61e6c6..4815e77 100644
+--- a/tests/agent/transports/test_hermes_tools_mcp_server.py
++++ b/tests/agent/transports/test_hermes_tools_mcp_server.py
+@@ -46,15 +46,16 @@ class TestModuleSurface:
+             "vision_analyze",
+             "image_generate",
+             "skill_view",
++            "memory",
++            "session_search",
+         ):
+             assert required in EXPOSED_TOOLS, f"missing {required!r}"
+ 
+     def test_agent_loop_tools_not_exposed(self):
+-        """delegate_task / memory / session_search / todo require the
+-        running AIAgent context to dispatch, so a stateless MCP callback
+-        can't drive them. They must NOT be in EXPOSED_TOOLS."""
++        """Delegation/todo require live AIAgent state; external runtimes
++        provide native substitutes. They must not be proxied."""
+         from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+-        for agent_loop_tool in ("delegate_task", "memory", "session_search", "todo"):
++        for agent_loop_tool in ("delegate_task", "todo"):
+             assert agent_loop_tool not in EXPOSED_TOOLS, (
+                 f"{agent_loop_tool!r} requires the agent loop context "
+                 "and can't be reached through a stateless MCP callback"
+@@ -131,3 +132,105 @@ class TestMain:
+         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
+         rc = m.main([])
+         assert rc == 1
++
++
++def test_profile_mcp_tools_are_reexported(monkeypatch):
++    """External agent runtimes retain profile-configured MCP tools."""
++    import sys
++    from types import ModuleType
++
++    import agent.transports.hermes_tools_mcp_server as m
++    import model_tools
++
++    registered = []
++
++    class FakeFastMCP:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def add_tool(self, fn, *, name, description):
++            registered.append(name)
++
++    fake_fastmcp = ModuleType("mcp.server.fastmcp")
++    fake_fastmcp.FastMCP = FakeFastMCP
++    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
++    monkeypatch.setattr(
++        "hermes_cli.mcp_startup._discover_mcp_tools_without_interactive_oauth",
++        lambda: None,
++    )
++    monkeypatch.setattr(
++        model_tools,
++        "get_tool_definitions",
++        lambda **kwargs: [
++            {
++                "type": "function",
++                "function": {
++                    "name": "mcp__example__lookup",
++                    "description": "lookup",
++                    "parameters": {"type": "object", "properties": {}},
++                },
++            }
++        ],
++    )
++    monkeypatch.setattr(
++        model_tools, "handle_function_call", lambda name, args: "ok"
++    )
++
++    m._build_server()
++
++    assert "mcp__example__lookup" in registered
++
++
++def test_real_fastmcp_uses_authoritative_schema_and_normal_kwargs(monkeypatch):
++    import asyncio
++
++    import agent.transports.hermes_tools_mcp_server as m
++    import model_tools
++
++    calls = []
++    schema = {
++        "type": "object",
++        "properties": {
++            "query": {"type": "string"},
++            "limit": {"type": "integer", "minimum": 1},
++        },
++        "required": ["query"],
++    }
++    monkeypatch.setattr(
++        "hermes_cli.mcp_startup._discover_mcp_tools_without_interactive_oauth",
++        lambda: None,
++    )
++    monkeypatch.setattr(
++        model_tools,
++        "get_tool_definitions",
++        lambda **kwargs: [
++            {
++                "type": "function",
++                "function": {
++                    "name": "mcp__example__lookup",
++                    "description": "lookup",
++                    "parameters": schema,
++                },
++            }
++        ],
++    )
++
++    def dispatch(name, args):
++        calls.append((name, args))
++        return "ok"
++
++    monkeypatch.setattr(model_tools, "handle_function_call", dispatch)
++
++    server = m._build_server()
++    tool = server._tool_manager.get_tool("mcp__example__lookup")
++    result = asyncio.run(
++        server._tool_manager.call_tool(
++            "mcp__example__lookup", {"query": "needle", "limit": 2}
++        )
++    )
++
++    assert tool.parameters == schema
++    assert result == "ok"
++    assert calls == [
++        ("mcp__example__lookup", {"query": "needle", "limit": 2})
++    ]
+diff --git a/tests/gateway/test_kanban_notifier.py b/tests/gateway/test_kanban_notifier.py
+index 22c70e1..9605b5c 100644
+--- a/tests/gateway/test_kanban_notifier.py
++++ b/tests/gateway/test_kanban_notifier.py
+@@ -1,19 +1,25 @@
+ import asyncio
+ from pathlib import Path
++from types import SimpleNamespace
+ 
+ 
+ from gateway.config import Platform
+ from gateway.run import GatewayRunner
++from gateway.session import SessionSource
+ from hermes_cli import kanban_db as kb
+ 
+ 
+ class RecordingAdapter:
+     def __init__(self):
+         self.sent = []
++        self.handled = []
+ 
+     async def send(self, chat_id, text, metadata=None):
+         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+ 
++    async def handle_message(self, event):
++        self.handled.append(event)
++
+ 
+ class DisconnectedAdapters(dict):
+     """Expose a platform during collection, then simulate disconnect on get()."""
+@@ -105,6 +111,109 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
+     assert adapter2.sent == []
+ 
+ 
++def test_kanban_notifier_wakes_exact_originating_dm_session(tmp_path, monkeypatch):
++    db_path = tmp_path / "dm-session-wake.db"
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
++    kb.init_db()
++
++    session_id = "creator-session-123"
++    conn = kb.connect()
++    try:
++        tid = kb.create_task(
++            conn,
++            title="wake creator",
++            assignee="worker",
++            session_id=session_id,
++        )
++        kb.add_notify_sub(
++            conn,
++            task_id=tid,
++            platform="telegram",
++            chat_id="chat-1",
++            user_id="user-1",
++        )
++        kb.complete_task(conn, tid, summary="done")
++    finally:
++        conn.close()
++
++    origin = SessionSource(
++        platform=Platform.TELEGRAM,
++        chat_id="chat-1",
++        chat_type="dm",
++        user_id="user-1",
++        message_id="original-message",
++    )
++    adapter = RecordingAdapter()
++    runner = _make_runner(adapter)
++    runner.session_store = SimpleNamespace(
++        _entries={
++            "agent:main:telegram:dm:chat-1": SimpleNamespace(
++                session_id=session_id,
++                origin=origin,
++            )
++        }
++    )
++
++    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
++
++    assert len(adapter.sent) == 1
++    assert len(adapter.handled) == 1
++    wake = adapter.handled[0]
++    assert wake.internal is True
++    assert wake.source.chat_type == "dm"
++    assert wake.source.chat_id == "chat-1"
++    assert wake.source.user_id == "user-1"
++    assert wake.source.message_id is None
++    assert session_id == runner.session_store._entries[
++        "agent:main:telegram:dm:chat-1"
++    ].session_id
++
++
++def test_kanban_notifier_refuses_mismatched_session_origin(tmp_path, monkeypatch):
++    db_path = tmp_path / "mismatched-session-wake.db"
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
++    kb.init_db()
++
++    session_id = "other-chat-session"
++    conn = kb.connect()
++    try:
++        tid = kb.create_task(
++            conn,
++            title="do not misroute",
++            assignee="worker",
++            session_id=session_id,
++        )
++        kb.add_notify_sub(
++            conn,
++            task_id=tid,
++            platform="telegram",
++            chat_id="chat-1",
++        )
++        kb.complete_task(conn, tid, summary="done")
++    finally:
++        conn.close()
++
++    adapter = RecordingAdapter()
++    runner = _make_runner(adapter)
++    runner.session_store = SimpleNamespace(
++        _entries={
++            "agent:main:telegram:dm:chat-2": SimpleNamespace(
++                session_id=session_id,
++                origin=SessionSource(
++                    platform=Platform.TELEGRAM,
++                    chat_id="chat-2",
++                    chat_type="dm",
++                ),
++            )
++        }
++    )
++
++    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
++
++    assert len(adapter.sent) == 1
++    assert adapter.handled == []
++
++
+ def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
+     db_path = tmp_path / "adapter-disconnect.db"
+     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+diff --git a/tests/gateway/test_session_env.py b/tests/gateway/test_session_env.py
+index f5392ab..ffda4bb 100644
+--- a/tests/gateway/test_session_env.py
++++ b/tests/gateway/test_session_env.py
+@@ -244,6 +244,36 @@ def test_set_session_env_includes_session_key():
+     assert get_session_env("HERMES_SESSION_KEY") != "tg:-1001:17585"
+ 
+ 
++def test_set_session_env_forwards_durable_session_id_to_subprocess(monkeypatch):
++    """Kanban tools in child runtimes must receive the creator session id."""
++    from tools.environments.local import hermes_subprocess_env
++
++    runner = object.__new__(GatewayRunner)
++    source = SessionSource(
++        platform=Platform.TELEGRAM,
++        chat_id="2144471399",
++        chat_type="dm",
++        user_id="123456",
++    )
++    context = SessionContext(
++        source=source,
++        connected_platforms=[],
++        home_channels={},
++        session_key="agent:main:telegram:dm:2144471399",
++        session_id="durable-session-123",
++    )
++    monkeypatch.setenv("HERMES_SESSION_ID", "stale-process-global")
++
++    tokens = runner._set_session_env(context)
++    try:
++        child_env = hermes_subprocess_env(inherit_credentials=False)
++    finally:
++        runner._clear_session_env(tokens)
++
++    assert get_session_env("HERMES_SESSION_ID") == ""
++    assert child_env["HERMES_SESSION_ID"] == "durable-session-123"
++
++
+ def test_session_key_no_race_condition_with_contextvars(monkeypatch):
+     """Prove contextvars isolates SESSION_KEY across concurrent async tasks.
+ 
+@@ -393,4 +423,3 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
+             await runner._run_in_executor_with_context(lambda: "second")
+     finally:
+         runner._shutdown_executor()
+-
 diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
 index f2e65dd..fd9f106 100644
 --- a/tests/hermes_cli/test_auth_commands.py
@@ -1373,6 +3256,293 @@ index f2e65dd..fd9f106 100644
  def test_credential_sources_find_step_copilot_before_generic_env(tmp_path, monkeypatch):
      """copilot env:GH_TOKEN must dispatch to the copilot step, not the
      generic env-var step.  The copilot step handles the duplicate-source
+diff --git a/tests/run_agent/test_claude_code_runtime.py b/tests/run_agent/test_claude_code_runtime.py
+new file mode 100644
+index 0000000..4530784
+--- /dev/null
++++ b/tests/run_agent/test_claude_code_runtime.py
+@@ -0,0 +1,281 @@
++from __future__ import annotations
++
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import run_agent
++from agent.credential_pool import PooledCredential
++from agent.transports.claude_code_session import ClaudeCodeSession, ClaudeTurnResult
++from hermes_cli.runtime_provider import _VALID_API_MODES, _resolve_runtime_from_pool_entry
++
++
++def _entry(config_dir="/tmp/test-claude-account"):
++    return PooledCredential.from_dict(
++        "anthropic",
++        {
++            "id": "entry-test",
++            "label": "test",
++            "auth_type": "oauth",
++            "priority": 0,
++            "source": "claude_code:test",
++            "access_token": "test-token",
++            "claude_config_dir": config_dir,
++        },
++    )
++
++
++def _make_agent(**kwargs):
++    return run_agent.AIAgent(
++        api_key="test-token",
++        base_url="acp://claude-code",
++        provider="anthropic",
++        api_mode="claude_code",
++        model="claude-test",
++        quiet_mode=True,
++        skip_context_files=True,
++        skip_memory=True,
++        **kwargs,
++    )
++
++
++def test_claude_code_is_valid_api_mode():
++    assert "claude_code" in _VALID_API_MODES
++
++
++def test_claude_config_pool_entry_selects_agent_runtime(monkeypatch):
++    monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
++    resolved = _resolve_runtime_from_pool_entry(
++        provider="anthropic",
++        entry=_entry(),
++        requested_provider="anthropic",
++        model_cfg={"default": "claude-test", "provider": "anthropic"},
++    )
++
++    assert resolved["api_mode"] == "claude_code"
++    assert resolved["base_url"] == "acp://claude-code"
++
++
++def test_native_escape_hatch_keeps_messages_runtime(monkeypatch):
++    monkeypatch.setenv("HERMES_ANTHROPIC_RUNTIME", "native")
++    resolved = _resolve_runtime_from_pool_entry(
++        provider="anthropic",
++        entry=_entry(),
++        requested_provider="anthropic",
++        model_cfg={"default": "claude-test", "provider": "anthropic"},
++    )
++
++    assert resolved["api_mode"] == "anthropic_messages"
++    assert resolved["base_url"] == "https://api.anthropic.com"
++
++
++def test_agent_runtime_streams_and_never_reexecutes_projected_tools(monkeypatch):
++    def fake_run_turn(self, *, prompt, timeout=900.0):
++        self.on_text_delta("work")
++        self.on_tool_started("Bash", {"command": "printf ok"})
++        self.on_tool_completed("Bash")
++        self.on_text_delta("done")
++        return ClaudeTurnResult(
++            final_text="done",
++            projected_messages=[
++                {
++                    "role": "assistant",
++                    "content": "work",
++                    "tool_calls": [
++                        {
++                            "id": "tool-1",
++                            "type": "function",
++                            "function": {
++                                "name": "Bash",
++                                "arguments": '{"command":"printf ok"}',
++                            },
++                        }
++                    ],
++                },
++                {
++                    "role": "tool",
++                    "name": "Bash",
++                    "tool_call_id": "tool-1",
++                    "content": "ok",
++                },
++                {"role": "assistant", "content": "done"},
++            ],
++            token_usage={"input_tokens": 8, "output_tokens": 2},
++            session_id="claude-session-test",
++            tool_iterations=1,
++            side_effects_possible=True,
++        )
++
++    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
++    agent = _make_agent()
++    deltas = []
++    agent.stream_delta_callback = deltas.append
++
++    with (
++        patch.object(
++            agent,
++            "_execute_tool_calls",
++            side_effect=AssertionError("Hermes must not re-run Claude tools"),
++        ) as execute,
++        patch.object(agent, "_spawn_background_review", return_value=None),
++    ):
++        result = agent.run_conversation("run the command")
++
++    assert result["completed"] is True
++    assert result["partial"] is False
++    assert result["final_response"] == "done"
++    assert result["claude_session_id"] == "claude-session-test"
++    assert result["agent_persisted"] is True
++    assert result["prompt_tokens"] == 8
++    assert result["completion_tokens"] == 2
++    assert deltas == ["work", None, "done"]
++    execute.assert_not_called()
++    assert any(message.get("role") == "tool" for message in result["messages"])
++    assert agent.client is None
++
++
++def test_runtime_delivers_answer_before_terminal_wakeup_ack(monkeypatch):
++    """A control-tool epilogue must not replace the substantive answer."""
++    answer = "GPU status and the independent review plan."
++    wake_ack = "Waiting. The harness will wake me on task completion."
++
++    def fake_run_turn(self, *, prompt, timeout=900.0):
++        return ClaudeTurnResult(
++            final_text=wake_ack,
++            projected_messages=[
++                {
++                    "role": "assistant",
++                    "content": "Checking the board now.",
++                    "tool_calls": [
++                        {
++                            "id": "tool-1",
++                            "type": "function",
++                            "function": {"name": "Bash", "arguments": "{}"},
++                        }
++                    ],
++                },
++                {
++                    "role": "tool",
++                    "name": "Bash",
++                    "tool_call_id": "tool-1",
++                    "content": "ok",
++                },
++                {"role": "assistant", "content": answer},
++                {
++                    "role": "assistant",
++                    "content": None,
++                    "tool_calls": [
++                        {
++                            "id": "tool-2",
++                            "type": "function",
++                            "function": {
++                                "name": "ScheduleWakeup",
++                                "arguments": "{}",
++                            },
++                        }
++                    ],
++                },
++                {
++                    "role": "tool",
++                    "name": "ScheduleWakeup",
++                    "tool_call_id": "tool-2",
++                    "content": "scheduled",
++                },
++                {"role": "assistant", "content": wake_ack},
++            ],
++            tool_iterations=2,
++            side_effects_possible=True,
++        )
++
++    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
++    agent = _make_agent()
++
++    with patch.object(agent, "_spawn_background_review", return_value=None):
++        result = agent.run_conversation("check status and schedule a wakeup")
++
++    assert result["completed"] is True
++    assert result["final_response"] == f"{answer}\n\n{wake_ack}"
++    assert "Checking the board now." not in result["final_response"]
++
++
++def test_interrupt_reaches_active_claude_session():
++    agent = _make_agent()
++    session = patch("agent.transports.claude_code_session.ClaudeCodeSession").start()
++    try:
++        agent._claude_code_session = session
++        agent.interrupt("new input")
++        session.request_interrupt.assert_called_once_with()
++    finally:
++        patch.stopall()
++
++
++def test_failover_retries_a_clean_auth_failure(monkeypatch):
++    config_dirs = ["/tmp/claude-a", "/tmp/claude-b"]
++    calls = []
++
++    def fake_run_turn(self, *, prompt, timeout=900.0):
++        calls.append(self.claude_config_dir)
++        if self.claude_config_dir.endswith("claude-a"):
++            return ClaudeTurnResult(
++                error="OAuth session expired",
++                status_code=401,
++            )
++        return ClaudeTurnResult(
++            final_text="recovered",
++            projected_messages=[{"role": "assistant", "content": "recovered"}],
++        )
++
++    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
++    agent = _make_agent()
++    pool = MagicMock()
++    pool.entries.return_value = [SimpleNamespace(), SimpleNamespace()]
++    agent._credential_pool = pool
++    agent._client_kwargs["claude_config_dir"] = config_dirs[0]
++
++    def recover(**kwargs):
++        agent._client_kwargs["claude_config_dir"] = config_dirs[1]
++        return True, False
++
++    agent._recover_with_credential_pool = MagicMock(side_effect=recover)
++    with patch.object(agent, "_spawn_background_review", return_value=None):
++        result = agent.run_conversation("recover")
++
++    assert result["completed"] is True
++    assert result["final_response"] == "recovered"
++    assert calls == [str(Path(path).resolve()) for path in config_dirs]
++    agent._recover_with_credential_pool.assert_called_once()
++
++
++def test_failover_never_replays_after_native_tool_started(monkeypatch):
++    def fake_run_turn(self, *, prompt, timeout=900.0):
++        return ClaudeTurnResult(
++            error="rate limit after tool",
++            status_code=429,
++            side_effects_possible=True,
++            projected_messages=[
++                {
++                    "role": "assistant",
++                    "content": None,
++                    "tool_calls": [
++                        {
++                            "id": "tool-1",
++                            "type": "function",
++                            "function": {"name": "Bash", "arguments": "{}"},
++                        }
++                    ],
++                }
++            ],
++        )
++
++    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
++    agent = _make_agent()
++    pool = MagicMock()
++    pool.entries.return_value = [SimpleNamespace(), SimpleNamespace()]
++    agent._credential_pool = pool
++    agent._recover_with_credential_pool = MagicMock(return_value=(True, False))
++
++    result = agent.run_conversation("do not replay")
++
++    assert result["completed"] is False
++    assert result["partial"] is True
++    agent._recover_with_credential_pool.assert_not_called()
 diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
 index afb45a5..3d6ebf7 100644
 --- a/tests/run_agent/test_run_agent.py
@@ -1505,10 +3675,10 @@ index afb45a5..3d6ebf7 100644
  
      def test_recover_with_pool_refreshes_on_401(self, agent):
 diff --git a/website/docs/user-guide/features/credential-pools.md b/website/docs/user-guide/features/credential-pools.md
-index 5d8503b..872d35a 100644
+index 5d8503b..a4a5ea4 100644
 --- a/website/docs/user-guide/features/credential-pools.md
 +++ b/website/docs/user-guide/features/credential-pools.md
-@@ -190,6 +190,39 @@ Hermes automatically discovers credentials from multiple sources and seeds the p
+@@ -190,6 +190,43 @@ Hermes automatically discovers credentials from multiple sources and seeds the p
  
  Auto-seeded entries are updated on each pool load — if you remove an env var, its pool entry is automatically pruned. Manual entries (added via `hermes auth add`) are never auto-pruned.
  
@@ -1544,6 +3714,10 @@ index 5d8503b..872d35a 100644
 +Both `claude_config_dir` and `CLAUDE_CONFIG_DIR` are accepted on input. Hermes normalizes the field to `claude_config_dir` and assigns each non-default directory a stable `claude_code:<hash>` source id. On macOS it reads Claude Code's directory-scoped Keychain service; elsewhere it reads `<claude_config_dir>/.credentials.json`. Access and refresh tokens remain borrowed from Claude Code and are not copied into `auth.json`.
 +
 +The process-level `CLAUDE_CONFIG_DIR` remains the backward-compatible single-account default. Explicit pool rows are what enable several Claude Code accounts in one Hermes profile and one rotation pool.
++
++Claude Code-sourced rows use the official streaming Claude Code agent runtime automatically. Claude Code owns its native Bash/file/subagent loop while Hermes relays partial output, persists the completed tool history, and exposes enabled Hermes/profile MCP tools through a local stdio bridge. API-key-only Anthropic rows continue to use the Messages API. Set `model.anthropic_runtime: native` to force the Messages path, or `claude_code` to select the agent runtime explicitly (`claude_code_cli` remains a compatibility alias).
++
++On a 401/429 before any tool starts, Hermes can rotate to the next config directory and retry. Once a native tool has started, Hermes does not replay the turn because doing so could duplicate file or command side effects.
 +
  Borrowed runtime secrets (for example env vars, Bitwarden/Vault/keyring/systemd references, and custom config values) are reference-only at the `auth.json` boundary. Hermes can use the resolved value in memory for the current run, but it persists only metadata such as the source ref, label, status, request counters, and a non-reversible fingerprint. Manual entries and Hermes-owned OAuth/device-code state keep the durable tokens they need to refresh.
  

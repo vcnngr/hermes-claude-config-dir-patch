@@ -7,7 +7,9 @@ Current adapter/runtime regression commands:
 ```bash
 cd ~/.hermes/hermes-agent
 venv/bin/pytest -q \
-  tests/agent/test_claude_code_cli_client.py \
+  tests/agent/transports/test_claude_code_session.py \
+  tests/run_agent/test_claude_code_runtime.py \
+  tests/agent/transports/test_hermes_tools_mcp_server.py \
   tests/agent/test_credential_pool_routing.py \
   tests/agent/test_credential_pool.py
 
@@ -16,7 +18,8 @@ venv/bin/pytest -q \
   tests/run_agent/test_run_agent.py
 ```
 
-Current result: `675 passed, 0 failed` across these two groups.
+Current result: `122 passed, 0 failed` and `575 passed, 0 failed` (`697`
+total) across these two groups.
 
 The older credential hydration regression set remains useful:
 
@@ -27,6 +30,23 @@ venv/bin/pytest -q \
   tests/agent/test_credential_pool.py \
   tests/hermes_cli/test_auth_commands.py
 ```
+
+Current result: `337 passed, 0 failed`.
+
+The session-identity/Kanban wake regression set is:
+
+```bash
+venv/bin/pytest -q \
+  tests/gateway/test_session_env.py \
+  tests/gateway/test_kanban_notifier.py \
+  tests/gateway/test_internal_event_bypass_pairing.py \
+  tests/tools/test_kanban_tools.py \
+  tests/agent/transports/test_hermes_tools_mcp_server.py \
+  tests/agent/transports/test_claude_code_session.py \
+  tests/run_agent/test_claude_code_runtime.py
+```
+
+Current result: `157 passed, 0 failed`.
 
 Coverage includes:
 
@@ -39,12 +59,28 @@ Coverage includes:
 - scoped refresh/resync and removal matching;
 - existing Anthropic/Nous credential-pool regressions.
 
+Runtime coverage includes:
+
+- real incremental text/reasoning callbacks from `stream-json`;
+- native tool start/completion projection without Hermes re-execution;
+- stdin prompt delivery and exact `CLAUDE_CONFIG_DIR` environment isolation;
+- active profile toolset propagation into the Hermes MCP bridge;
+- profile MCP, memory, session-search, kanban, and stateless tool exposure;
+- clean 401/429 credential rotation;
+- no turn replay after native tool execution may have side effects;
+- subprocess interrupt/close handling and session persistence.
+- complete delivery when an answer precedes a control-tool/wakeup epilogue;
+- durable gateway `session_id` propagation into child/MCP environments;
+- exact DM/group/thread origin recovery for internal Kanban completion wakes;
+- fail-closed refusal when a task session and notification destination differ;
+- credential tests isolated from the operator's host Keychain.
+
 ## Real local hydration test
 
-Use only `codexauthtest`:
+Use only one explicitly authorized test profile:
 
 ```bash
-HERMES_HOME=~/.hermes/profiles/codexauthtest hermes auth list anthropic
+HERMES_HOME=~/.hermes/profiles/YOUR_AUTHORIZED_PROFILE hermes auth list anthropic
 ```
 
 Expected: the default `claude_code` row plus one distinct
@@ -56,12 +92,19 @@ Safe assertions:
 - distinct runtime credential values in memory;
 - each persisted fingerprint matches the corresponding scoped Keychain item;
 - no `access_token` or `refresh_token` keys in profile `auth.json`;
-- only the `codexauthtest` profile changed.
+- only the explicitly authorized profile changed.
 
-For the 2026-07-14 adapter validation, the user explicitly authorized one
-profile. The default directory returned HTTP 401; Hermes rotated automatically
-to the next configured directory, and official `claude -p` returned `OK`.
-Future tests use a dedicated test profile unless explicitly authorized.
+For the 2026-07-15 runtime validation, the user explicitly authorized one
+profile. The first selected directory returned HTTP 401; Hermes rotated to the
+next directory. Official Claude Code then executed one Bash canary, persisted
+`STREAM_CODE_OK`, and returned `CANARY_OK`. No other profile made a live
+Anthropic request. Future tests still require explicit authorization.
+
+The 2026-07-15 Kanban session-wake change used temporary test databases only;
+it made no live Anthropic request and changed no profile or real board data.
+
+The 2026-07-15 multi-block delivery fix used synthetic Claude stream events
+only; it made no live Anthropic request and changed no profile or board data.
 
 Do not print token values. Do not make a live Anthropic inference request
 unless the user explicitly authorizes usage consumption.

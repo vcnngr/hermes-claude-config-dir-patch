@@ -27,26 +27,35 @@ auth.json row
   -> select/rotate through normal Anthropic pool
 ```
 
-The optional profile setting below switches inference to the official CLI:
+Claude-sourced pool rows switch inference to the official runtime
+automatically. API-key-only rows stay on the direct Messages API. Explicit
+configuration remains available:
 
 ```yaml
 model:
-  anthropic_runtime: claude_code_cli
+  anthropic_runtime: claude_code
 ```
+
+`claude_code_cli` remains a compatibility alias. `native` forces the direct
+Messages API.
 
 Runtime flow:
 
 ```text
 selected pool entry
-  -> pass its claude_config_dir to ClaudeCodeCLIClient
-  -> strip ambient Anthropic token variables
+  -> pass its claude_config_dir to ClaudeCodeSession
+  -> strip ambient Anthropic token/provider variables
   -> set child CLAUDE_CONFIG_DIR
-  -> run official claude -p with JSON output
-  -> map result/usage into Hermes' chat-completion interface
-  -> rotate pool entry on 401/429
+  -> send the compressed Hermes turn over stdin (not process arguments)
+  -> run official claude -p with stream-json + partial messages
+  -> Claude owns its native Bash/file/MCP agent loop
+  -> relay text/reasoning/tool progress to Hermes as it arrives
+  -> project completed assistant/tool events into Hermes session history
+  -> compose standalone assistant blocks for complete gateway delivery
+  -> classify 401/429 and rotate before tool execution only
 ```
 
-For `/Users/example/.claude-work`:
+For `~/.claude-work`:
 
 ```text
 keychain: Claude Code-credentials-<sha256(path)[:8]>
@@ -57,6 +66,42 @@ Default `~/.claude` retains `source: claude_code` for compatibility. Its
 Keychain lookup tries the scoped service first, then the old unsuffixed service.
 Alternative directories never fall back to the default service, preventing
 cross-account borrowing.
+
+## Runtime ownership boundary
+
+Claude Code executes native tools. Projected tool calls are persistence records
+only; Hermes never dispatches them again. This restores autonomous multi-step
+work while preventing double execution.
+
+Claude Code's terminal `result` event contains only its last assistant block.
+When a substantive answer is followed by a control tool and a short epilogue
+such as “Waiting”, Hermes composes the distinct standalone assistant blocks for
+gateway delivery. Tool-call preambles remain progress-only, while every
+substantive answer stays visible instead of existing only in session history.
+
+The child runs in the Hermes session cwd with permission mode `auto` by
+default. `HERMES_CLAUDE_PERMISSION_MODE` can override it. Interrupt/close
+signals terminate the active CLI process.
+
+Hermes capabilities without a Claude native equivalent are exposed through a
+stdio MCP subprocess. The subprocess receives only active profile/toolset
+scope, not OAuth tokens in command arguments. It re-exports profile MCP tools,
+kanban, browser/web/vision, skills, cron, built-in memory, and session search.
+Context-bound duplicates such as terminal/file tools, clarify, Hermes todo, and
+Hermes delegation remain excluded; Claude Code supplies native equivalents for
+execution, planning, and subagents.
+
+The gateway binds both the routing key and durable `session_id` into the turn's
+task-local context. The subprocess environment bridge carries that identity to
+Claude Code and the Hermes MCP server. `kanban_create` persists it with the
+task. On terminal Kanban events, the notifier resolves the stored session's
+exact `SessionSource` and injects the internal wake only when platform, chat,
+thread, participant, and profile still match. It never guesses `chat_type`, so
+DM creators resume their existing session instead of a fresh group session.
+
+Credential failover replays a turn only when no native tool has started. Once
+Bash/Edit/MCP execution may have produced side effects, failure is returned as
+partial instead of risking duplicate writes or commands.
 
 ## Persistence boundary
 
@@ -85,9 +130,17 @@ default-directory discovery; scoped rows remain available.
 - `agent/credential_pool.py`: schema alias, scoped hydration, source ranking,
   refresh/resync isolation.
 - `agent/credential_sources.py`: removal matching for scoped source ids.
-- `agent/claude_code_cli_client.py`: small OpenAI-compatible facade over
-  official `claude -p`.
-- `hermes_cli/runtime_provider.py`: profile opt-in runtime selection.
-- `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `run_agent.py`:
-  selected-directory propagation and credential rotation.
-- Focused tests and credential-pool docs.
+- `agent/transports/claude_code_session.py`: CLI lifecycle, stream parsing,
+  event projection, tool progress, interrupt, and environment isolation.
+- `agent/claude_runtime.py`: turn ownership, complete multi-block delivery,
+  safe pool failover, persistence, memory sync, and usage accounting.
+- `agent/transports/hermes_tools_mcp_server.py`: profile-scoped stateless
+  Hermes/MCP capability bridge shared with external runtimes.
+- `gateway/run.py`, `gateway/kanban_watchers.py`: durable session-id propagation
+  and exact-origin Kanban wake routing.
+- `hermes_cli/runtime_provider.py`: automatic runtime selection and native
+  escape hatch.
+- `agent/agent_init.py`, `agent/conversation_loop.py`,
+  `agent/agent_runtime_helpers.py`, `run_agent.py`: selected-directory
+  propagation, early external-runtime routing, rotation, and interruption.
+- Focused runtime, gateway, Kanban, credential tests, and credential-pool docs.
