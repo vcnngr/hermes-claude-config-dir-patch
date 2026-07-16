@@ -2,6 +2,24 @@
 
 ## Automated regression suite
 
+Installer regression suite:
+
+```bash
+cd /path/to/hermes-claude-config-dir-patch
+python3 -m pytest -q tests/test_hermes_patch_installer.py
+```
+
+Current result: `11 passed, 0 failed`. Coverage includes exact-commit and
+SHA-256 gating, idempotent install/remove, dirty-file protection, preservation
+of unrelated changes, metadata-only profile writes, backups, path-traversal
+rejection, malformed-profile handling, dry runs, and explicit setup-token slot
+selection.
+
+An end-to-end installer run used a temporary clean worktree at upstream commit
+`226e8de8`. Install, status, Python compilation, `14` focused Hermes tests,
+remove, and final clean-tree checks passed. It did not modify a real profile,
+read or write real credentials, or make a live Anthropic request.
+
 Current adapter/runtime regression commands:
 
 ```bash
