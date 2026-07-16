@@ -22,10 +22,9 @@ rg -n "claude_config_dir|CLAUDE_CONFIG_DIR|Claude Code-credentials" agent tests 
 ## 2. Remove old patch if required by updater
 
 ```bash
-cd ~/.hermes/hermes-agent
-OLD=~/Documents/claude/hermes-claude-config-dir-patch/patches/v0.18.2/hermes-claude-config-dir-multipool.patch
-git apply --check --reverse "$OLD"
-git apply --reverse "$OLD"
+cd /path/to/hermes-claude-config-dir-patch
+python3 scripts/hermes_patch.py remove --dry-run
+python3 scripts/hermes_patch.py remove
 hermes update
 ```
 
@@ -33,11 +32,12 @@ This reverses only tracked hunks from this patch. Never use a hard reset.
 
 ## 3. Reapply or port
 
-First attempt:
+After checking for equivalent upstream support, add the new base and patch to
+`patches/manifest.json`. Then use the manager for the first attempt:
 
 ```bash
-git apply --check "$OLD"
-git apply --3way "$OLD"
+python3 scripts/hermes_patch.py install --dry-run
+python3 scripts/hermes_patch.py install
 ```
 
 If it conflicts, inspect new upstream behavior and reproduce only the required
@@ -98,17 +98,19 @@ git apply --check --reverse "$OUT/hermes-claude-config-dir-multipool.patch"
 shasum -a 256 "$OUT/hermes-claude-config-dir-multipool.patch"
 ```
 
-Update README version table, SHA, `CLAUDE.md`, and test result. Keep older
-version directories so installed older Hermes copies remain recoverable.
+Update `patches/manifest.json`, README version table and SHA, `CLAUDE.md`, and
+test result. Keep older version directories so installed older Hermes copies
+remain recoverable. Verify every manifest SHA against its versioned patch.
 
 ## 6. Publish
 
 ```bash
 cd ~/Documents/claude/hermes-claude-config-dir-patch
 git status --short
-git add AGENTS.md CLAUDE.md LICENSE README.md docs patches
+git add AGENTS.md CLAUDE.md LICENSE README.md docs patches scripts tests
 git commit -m "Add Hermes <version> multi-Claude Code patch"
-git push origin main
+git push -u origin HEAD
 ```
 
-Verify the public raw patch URL and repository tree after push.
+Open a pull request, verify checks and diff, then merge. Verify the public raw
+patch URL and repository tree after merge.

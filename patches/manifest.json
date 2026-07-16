@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "patches": [
+    {
+      "hermes_version": "v0.18.2 (2026.7.7.2)",
+      "upstream_commit": "226e8de827a669e8ffa7035b27d70c19e44b1208",
+      "patch": "v0.18.2/hermes-claude-config-dir-multipool.patch",
+      "sha256": "261ef78d1e71da15c0a93cfb767802fb10b905693a7c0f86cb46bb9060250f48"
+    }
+  ]
+}

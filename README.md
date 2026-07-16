@@ -37,19 +37,21 @@ Supported base:
 Non-default source ids become `claude_code:<8-char-directory-hash>`. The
 default directory keeps `source: "claude_code"`.
 
-## Apply
+## Install
+
+Preferred path: clone this repository, run the read-only doctor, then install
+the manifest-pinned patch:
 
 ```bash
-mkdir -p ~/Documents/claude/hermes-claude-config-dir-patch/patches/v0.18.2
-curl -L \
-  https://raw.githubusercontent.com/vcnngr/hermes-claude-config-dir-patch/main/patches/v0.18.2/hermes-claude-config-dir-multipool.patch \
-  -o ~/Documents/claude/hermes-claude-config-dir-patch/patches/v0.18.2/hermes-claude-config-dir-multipool.patch
-
-cd ~/.hermes/hermes-agent
-PATCH=~/Documents/claude/hermes-claude-config-dir-patch/patches/v0.18.2/hermes-claude-config-dir-multipool.patch
-git apply --check "$PATCH"
-git apply --3way "$PATCH"
+git clone https://github.com/vcnngr/hermes-claude-config-dir-patch.git
+cd hermes-claude-config-dir-patch
+python3 scripts/hermes_patch.py doctor
+python3 scripts/hermes_patch.py install
 ```
+
+The installer accepts only a manifest-listed Hermes commit, verifies the local
+patch SHA-256, refuses overlapping checkout changes, and is idempotent. It
+does not download code at runtime or touch profile data during installation.
 
 Patch SHA-256:
 
@@ -59,7 +61,20 @@ Patch SHA-256:
 
 ## Configure one Hermes profile
 
-Add metadata-only rows to that profile's `auth.json`:
+Create a backup, then add metadata-only rows to one profile:
+
+```bash
+python3 scripts/hermes_patch.py configure-profile \
+  --profile YOUR_PROFILE \
+  --claude-dir ~/.claude-team \
+  --claude-dir ~/.claude-personal \
+  --label claude-team \
+  --label claude-personal
+```
+
+The command shows the proposed mapping and asks before writing. It preserves
+unrelated rows, removes token fields from matching rows, and stores the backup
+under the Hermes data directory. Equivalent JSON shape:
 
 ```json
 {
@@ -92,16 +107,24 @@ optional setup-token below. Hermes reads its matching credential on pool load.
 ### Optional one-year setup-token
 
 Claude Code's `setup-token` flow creates an inference-only OAuth token with a
-one-year lifetime. Generate it for one directory/account at a time:
+one-year lifetime. The guided command displays each profile label and config
+directory, launches the official flow sequentially, accepts the token through
+a hidden prompt, and verifies the scoped Keychain round trip:
+
+```bash
+python3 scripts/hermes_patch.py setup-tokens \
+  --profile YOUR_PROFILE \
+  --slot 1
+```
+
+Repeat with another `--slot`, or use `--all` to walk every configured row. The
+optional browser account hint is display-only and is never stored.
+
+Manual fallback for one directory:
 
 ```bash
 CLAUDE_CONFIG_DIR=~/.claude-team claude setup-token
-```
 
-Copy the emitted token, then store it through the patched adapter without
-placing it in shell history, process arguments, or `auth.json`:
-
-```bash
 cd ~/.hermes/hermes-agent
 CLAUDE_CONFIG_DIR=~/.claude-team venv/bin/python - <<'PY'
 import getpass
@@ -157,6 +180,14 @@ To exclude implicit `~/.claude` discovery while retaining scoped rows:
 
 ## Verify
 
+Read-only installer/profile diagnosis:
+
+```bash
+python3 scripts/hermes_patch.py doctor --profile YOUR_PROFILE
+```
+
+Hermes regression suite:
+
 ```bash
 cd ~/.hermes/hermes-agent
 venv/bin/pytest -q \
@@ -196,19 +227,20 @@ anthropic (2 credentials):
   #2  claude-personal  oauth  claude_code:yyyyyyyy
 ```
 
-## Update Hermes, then reapply
+## Update Hermes, then reinstall
 
 If the updater refuses a dirty checkout, remove only this patch first:
 
 ```bash
-cd ~/.hermes/hermes-agent
-PATCH=~/Documents/claude/hermes-claude-config-dir-patch/patches/v0.18.2/hermes-claude-config-dir-multipool.patch
-
-git apply --check --reverse "$PATCH"
-git apply --reverse "$PATCH"
+cd hermes-claude-config-dir-patch
+python3 scripts/hermes_patch.py remove
 hermes update
-git apply --3way "$PATCH"
+python3 scripts/hermes_patch.py install
 ```
+
+If the new Hermes commit is not listed in `patches/manifest.json`, installation
+stops safely. Check whether upstream now provides equivalent behavior; port
+and test a new versioned patch before reinstalling.
 
 Never use `git reset --hard` for this workflow: the Hermes checkout may contain
 unrelated local work. If upstream adds equivalent support, test upstream and
@@ -222,6 +254,10 @@ gateway/Kanban/runtime group passed `158`. Groups overlap. Coverage includes
 real FastMCP schema dispatch, streaming, safe failover, interrupt, persistence,
 complete multi-block delivery, exact originating-session wake, and the
 no-double-execution boundary.
+
+The installer suite passed `11` tests. A clean temporary checkout at the exact
+supported commit completed install, status, Python compilation, `14` focused
+Hermes tests, removal, and clean-tree verification.
 
 On 2026-07-15, an explicitly authorized profile passed a live end-to-end
 canary. One expired OAuth directory returned 401, Hermes rotated to the next
@@ -245,5 +281,6 @@ MIT. Hermes Agent is copyright Nous Research; see [LICENSE](LICENSE).
 ## Maintainer documentation
 
 - [Implementation](docs/IMPLEMENTATION.md)
+- [Automated installer](docs/INSTALLER.md)
 - [Maintenance runbook](docs/MAINTENANCE.md)
 - [Testing](docs/TESTING.md)
