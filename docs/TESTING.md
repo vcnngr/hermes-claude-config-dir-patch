@@ -18,7 +18,7 @@ venv/bin/pytest -q \
   tests/run_agent/test_run_agent.py
 ```
 
-Current result: `122 passed, 0 failed` and `575 passed, 0 failed` (`697`
+Current result: `123 passed, 0 failed` and `575 passed, 0 failed` (`698`
 total) across these two groups.
 
 The older credential hydration regression set remains useful:
@@ -31,7 +31,7 @@ venv/bin/pytest -q \
   tests/hermes_cli/test_auth_commands.py
 ```
 
-Current result: `337 passed, 0 failed`.
+Current result: `342 passed, 0 failed`.
 
 The session-identity/Kanban wake regression set is:
 
@@ -46,11 +46,14 @@ venv/bin/pytest -q \
   tests/run_agent/test_claude_code_runtime.py
 ```
 
-Current result: `157 passed, 0 failed`.
+Current result: `158 passed, 0 failed`.
 
 Coverage includes:
 
 - config-scoped Keychain service selection;
+- one-year setup-token storage over stdin, never process arguments;
+- setup-token priority with directory-matched login fallback;
+- selected-token injection into only the matching Claude CLI child;
 - legacy fallback only for default directory;
 - explicit credential-file read/write directory;
 - uppercase input alias normalization;
@@ -105,6 +108,14 @@ it made no live Anthropic request and changed no profile or real board data.
 
 The 2026-07-15 multi-block delivery fix used synthetic Claude stream events
 only; it made no live Anthropic request and changed no profile or board data.
+
+On 2026-07-16, the user explicitly completed official `claude setup-token`
+authorization for four configured directories in one authorized profile.
+Safe local checks confirmed four readable, distinct Keychain items, future
+expiry, and exact per-directory runtime selection. The user then confirmed a
+live end-to-end response. The maintenance process made no live Anthropic
+inference request, and the same shared credentials were not tested against any
+other profile.
 
 Do not print token values. Do not make a live Anthropic inference request
 unless the user explicitly authorizes usage consumption.
