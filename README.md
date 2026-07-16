@@ -39,19 +39,31 @@ default directory keeps `source: "claude_code"`.
 
 ## Install
 
-Preferred path: clone this repository, run the read-only doctor, then install
-the manifest-pinned patch:
+Latest stable installer release:
+[Hermes Patch Installer v0.1.0](https://github.com/vcnngr/hermes-claude-config-dir-patch/releases/tag/installer-v0.1.0).
+
+Preferred path: clone the immutable release tag, run the read-only doctor,
+then install the manifest-pinned patch:
 
 ```bash
-git clone https://github.com/vcnngr/hermes-claude-config-dir-patch.git
+git clone --branch installer-v0.1.0 --depth 1 \
+  https://github.com/vcnngr/hermes-claude-config-dir-patch.git
 cd hermes-claude-config-dir-patch
+git rev-parse HEAD
 python3 scripts/hermes_patch.py doctor
 python3 scripts/hermes_patch.py install
+```
+
+Expected release commit:
+
+```text
+e6cfbefcd16adc96bd43d79b77d49eb297876472
 ```
 
 The installer accepts only a manifest-listed Hermes commit, verifies the local
 patch SHA-256, refuses overlapping checkout changes, and is idempotent. It
 does not download code at runtime or touch profile data during installation.
+GitHub also provides source ZIP and TAR archives on the release page.
 
 Patch SHA-256:
 
