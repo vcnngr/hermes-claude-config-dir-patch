@@ -22,7 +22,8 @@ path and reads exactly that Claude Code credential source.
 auth.json row
   -> normalize config directory
   -> derive pool source id
-  -> derive macOS Keychain service
+  -> prefer config-scoped Hermes setup-token when present
+  -> otherwise read Claude Code login Keychain/file credentials
   -> hydrate borrowed token in memory
   -> select/rotate through normal Anthropic pool
 ```
@@ -46,6 +47,7 @@ selected pool entry
   -> pass its claude_config_dir to ClaudeCodeSession
   -> strip ambient Anthropic token/provider variables
   -> set child CLAUDE_CONFIG_DIR
+  -> set child CLAUDE_CODE_OAUTH_TOKEN only for its selected setup-token
   -> send the compressed Hermes turn over stdin (not process arguments)
   -> run official claude -p with stream-json + partial messages
   -> Claude owns its native Bash/file/MCP agent loop
@@ -58,14 +60,23 @@ selected pool entry
 For `~/.claude-work`:
 
 ```text
-keychain: Claude Code-credentials-<sha256(path)[:8]>
-pool:     claude_code:<sha256(path)[:8]>
+login keychain: Claude Code-credentials-<sha256(path)[:8]>
+setup keychain: Hermes Claude Code setup-token-v2-<sha256(path)[:8]>
+pool:           claude_code:<sha256(path)[:8]>
 ```
 
 Default `~/.claude` retains `source: claude_code` for compatibility. Its
 Keychain lookup tries the scoped service first, then the old unsuffixed service.
 Alternative directories never fall back to the default service, preventing
 cross-account borrowing.
+
+Long-lived setup-tokens remain separate from Claude Code's refreshable login
+item. Hermes stores their JSON payload over stdin using a fixed-path private
+Security.framework helper. The stable executable identity gives macOS
+Keychain a durable ACL without exposing the token in process arguments. Only
+the selected Claude CLI child receives the token environment variable; the
+Hermes MCP bridge remains credential-free. Missing, expired, or unreadable
+setup-token items fall back to the matching normal Claude Code login.
 
 ## Runtime ownership boundary
 
@@ -116,6 +127,10 @@ refresh tokens in memory. `auth.json` persists:
 It does not persist access or refresh tokens. Refresh writes back only to the
 entry's selected Claude config directory.
 
+Hermes setup-tokens also never enter `auth.json`. Their config-scoped Keychain
+items contain the token plus creation/expiry metadata and do not overwrite or
+delete Claude Code's own login credentials.
+
 ## Source identity and removal
 
 Scoped sources use `claude_code:<hash8>`. Existing pool deduplication,
@@ -126,7 +141,7 @@ default-directory discovery; scoped rows remain available.
 ## Touched upstream modules
 
 - `agent/anthropic_adapter.py`: path normalization, service derivation,
-  directory-aware reads/writes/refresh.
+  directory-aware reads/writes/refresh, setup-token Keychain storage.
 - `agent/credential_pool.py`: schema alias, scoped hydration, source ranking,
   refresh/resync isolation.
 - `agent/credential_sources.py`: removal matching for scoped source ids.

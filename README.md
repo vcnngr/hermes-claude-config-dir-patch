@@ -14,11 +14,14 @@ Supported base:
 - Multiple `claude_code` rows in one profile and one rotation pool.
 - Per-row `claude_config_dir`; uppercase `CLAUDE_CONFIG_DIR` accepted as alias.
 - macOS Keychain lookup using Claude Code's config-directory hash.
+- Optional one-year `claude setup-token` credentials, stored in a separate
+  config-scoped Hermes Keychain item and preferred over the 24-hour login.
 - Refresh/sync written back only to the matching Claude config directory.
 - Metadata and fingerprints in Hermes `auth.json`; no copied OAuth tokens.
 - Backward-compatible default `~/.claude` behavior.
 - Inference through official `claude -p --output-format stream-json`, using the
-  selected entry's directory.
+  selected entry's directory and, when configured, only that entry's
+  `CLAUDE_CODE_OAUTH_TOKEN`.
 - Real response deltas, native Bash/Read/Edit/Write agent loop, interrupts, and
   tool progress instead of a buffered chatbot-style completion.
 - Complete multi-block response delivery when Claude answers, invokes a
@@ -51,7 +54,7 @@ git apply --3way "$PATCH"
 Patch SHA-256:
 
 ```text
-aa521aadc059b9b023c71539ca9cd3d8289e1d1314eb47298a173bea1a77b90f
+261ef78d1e71da15c0a93cfb767802fb10b905693a7c0f86cb46bb9060250f48
 ```
 
 ## Configure one Hermes profile
@@ -83,8 +86,48 @@ Add metadata-only rows to that profile's `auth.json`:
 }
 ```
 
-Each directory must already be authenticated with Claude Code. Hermes reads
-its matching Keychain/file credentials on pool load.
+Each directory must either be authenticated with Claude Code or have the
+optional setup-token below. Hermes reads its matching credential on pool load.
+
+### Optional one-year setup-token
+
+Claude Code's `setup-token` flow creates an inference-only OAuth token with a
+one-year lifetime. Generate it for one directory/account at a time:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-team claude setup-token
+```
+
+Copy the emitted token, then store it through the patched adapter without
+placing it in shell history, process arguments, or `auth.json`:
+
+```bash
+cd ~/.hermes/hermes-agent
+CLAUDE_CONFIG_DIR=~/.claude-team venv/bin/python - <<'PY'
+import getpass
+import os
+
+from agent.anthropic_adapter import store_claude_code_setup_token
+
+store_claude_code_setup_token(
+    getpass.getpass("Paste setup-token (hidden): "),
+    os.environ["CLAUDE_CONFIG_DIR"],
+)
+print("Stored in macOS Keychain")
+PY
+```
+
+The patch compiles a private fixed-path Keychain helper with `xcrun swiftc` on
+first use. This is required because macOS ACLs bind secret access to the
+requesting executable.
+The token travels over stdin, is readable only through that helper, and is
+injected only into the selected Claude CLI child. Hermes MCP subprocesses do
+not receive it. If no valid setup-token exists, Hermes falls back to Claude
+Code's normal refreshable login for that directory.
+
+`claude auth status` may not expose setup-token identity and is not used as a
+validity gate. Setup-tokens do not support Remote Control; see the official
+[Claude Code authentication documentation](https://code.claude.com/docs/en/authentication).
 
 Claude-sourced Anthropic pool rows select the official runtime automatically.
 No per-profile config edit is required, so the behavior applies consistently
@@ -173,9 +216,9 @@ retire the downstream patch.
 
 ## Test result
 
-The two primary adapter/pool/runtime/MCP groups passed `697` tests on the
-supported base. The credential-hydration group passed `337`; the focused
-gateway/Kanban/runtime group passed `157`. Groups overlap. Coverage includes
+The two primary adapter/pool/runtime/MCP groups passed `698` tests on the
+supported base. The credential-hydration group passed `342`; the focused
+gateway/Kanban/runtime group passed `158`. Groups overlap. Coverage includes
 real FastMCP schema dispatch, streaming, safe failover, interrupt, persistence,
 complete multi-block delivery, exact originating-session wake, and the
 no-double-execution boundary.
@@ -188,6 +231,12 @@ request.
 
 The Kanban session-wake fix was validated without a live Anthropic request and
 without modifying profile or board data.
+
+On 2026-07-16, the user completed the official setup-token flow for four
+config-scoped accounts. Local checks confirmed four distinct Keychain items,
+roughly 365-day expiry, and exact runtime selection. A user-originated live
+message confirmed end-to-end operation; the maintenance process itself made
+no Anthropic inference request.
 
 ## License
 
