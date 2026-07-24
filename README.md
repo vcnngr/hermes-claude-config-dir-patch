@@ -16,6 +16,11 @@ Supported base:
 - macOS Keychain lookup using Claude Code's config-directory hash.
 - Optional one-year `claude setup-token` credentials, stored in a separate
   config-scoped Hermes Keychain item and preferred over the 24-hour login.
+- Linux support: the config-scoped setup-token store is Keychain-backed and
+  therefore macOS-only, so on other platforms the selected entry's token is
+  read from `<claude_config_dir>/.credentials.json` instead. Without this the
+  runtime passes an empty `CLAUDE_CODE_OAUTH_TOKEN` and `claude -p` falls back
+  to an interactive login.
 - Refresh/sync written back only to the matching Claude config directory.
 - Metadata and fingerprints in Hermes `auth.json`; no copied OAuth tokens.
 - Backward-compatible default `~/.claude` behavior.
@@ -68,7 +73,7 @@ GitHub also provides source ZIP and TAR archives on the release page.
 Patch SHA-256:
 
 ```text
-261ef78d1e71da15c0a93cfb767802fb10b905693a7c0f86cb46bb9060250f48
+9de54923398502faf255a82e56a2c54e06d46fbc2f824cb2564b6de1f5456468
 ```
 
 ## Configure one Hermes profile

@@ -1,5 +1,5 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index c5826b4..98570e3 100644
+index c5826b4b..98570e31 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -449,7 +449,7 @@ def init_agent(
@@ -42,7 +42,7 @@ index c5826b4..98570e3 100644
          # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
          # Region is extracted from the base_url or defaults to us-east-1.
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 1cde734..3941914 100644
+index 1cde7341..39419149 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -704,8 +704,8 @@ def recover_with_credential_pool(
@@ -93,7 +93,7 @@ index 1cde734..3941914 100644
          # but refresh cannot fix them — the OAuth token is already valid,
          # the account simply lacks the entitlement.  Without this guard,
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
-index 689d010..896a0ba 100644
+index 689d0101..896a0baf 100644
 --- a/agent/anthropic_adapter.py
 +++ b/agent/anthropic_adapter.py
 @@ -11,6 +11,7 @@ Auth supports:
@@ -590,10 +590,10 @@ index 689d010..896a0ba 100644
          existing = {}
 diff --git a/agent/claude_runtime.py b/agent/claude_runtime.py
 new file mode 100644
-index 0000000..f8177dc
+index 00000000..6aa0c94e
 --- /dev/null
 +++ b/agent/claude_runtime.py
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,427 @@
 +"""Claude Code external-agent runtime.
 +
 +This path bypasses Hermes' model/tool loop.  Claude Code receives the complete
@@ -605,6 +605,7 @@ index 0000000..f8177dc
 +
 +import logging
 +import os
++import platform
 +from typing import Any, Dict, List
 +
 +
@@ -647,6 +648,26 @@ index 0000000..f8177dc
 +            return str(creds.get("accessToken") or "").strip()
 +    except Exception:
 +        logger.debug("Could not read selected Claude setup-token", exc_info=True)
++
++    # Non-macOS fallback: the config-scoped setup-token store is Keychain-backed
++    # and Darwin-only, so read_claude_code_setup_token() returns None on Linux.
++    # There the Claude Code OAuth access token lives in <config_dir>/.credentials.json;
++    # inject it as CLAUDE_CODE_OAUTH_TOKEN so `claude` authenticates the selected
++    # pool account instead of falling back to an interactive login.
++    if platform.system() != "Darwin":
++        try:
++            from agent.anthropic_adapter import (
++                is_claude_code_token_valid,
++                read_claude_code_credentials,
++            )
++
++            creds = read_claude_code_credentials(config_dir)
++            if creds and is_claude_code_token_valid(creds):
++                return str(creds.get("accessToken") or "").strip()
++        except Exception:
++            logger.debug(
++                "Could not read selected Claude credentials fallback", exc_info=True
++            )
 +    return ""
 +
 +
@@ -1001,7 +1022,7 @@ index 0000000..f8177dc
 +
 +__all__ = ["run_claude_code_turn"]
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 12c80a8..72bfbe6 100644
+index 12c80a8b..72bfbe6b 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
 @@ -640,6 +640,18 @@ def run_conversation(
@@ -1024,7 +1045,7 @@ index 12c80a8..72bfbe6 100644
          # Reset per-turn checkpoint dedup so each iteration can take one snapshot
          agent._checkpoint_mgr.new_turn()
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
-index 3bd5949..b25158b 100644
+index 3bd59493..b25158ba 100644
 --- a/agent/credential_pool.py
 +++ b/agent/credential_pool.py
 @@ -125,9 +125,15 @@ _EXTRA_KEYS = frozenset({
@@ -1332,7 +1353,7 @@ index 3bd5949..b25158b 100644
      elif provider == "nous":
          state = _load_provider_state(auth_store, "nous")
 diff --git a/agent/credential_sources.py b/agent/credential_sources.py
-index 18f0823..78b26dd 100644
+index 18f0823b..78b26dd8 100644
 --- a/agent/credential_sources.py
 +++ b/agent/credential_sources.py
 @@ -197,9 +197,10 @@ def _remove_claude_code(provider: str, removed) -> RemovalResult:
@@ -1358,7 +1379,7 @@ index 18f0823..78b26dd 100644
      ))
 diff --git a/agent/transports/claude_code_session.py b/agent/transports/claude_code_session.py
 new file mode 100644
-index 0000000..5cb8080
+index 00000000..5cb80808
 --- /dev/null
 +++ b/agent/transports/claude_code_session.py
 @@ -0,0 +1,563 @@
@@ -1926,7 +1947,7 @@ index 0000000..5cb8080
 +    "build_turn_prompt",
 +]
 diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
-index 37f2d61..fab294b 100644
+index 37f2d617..fab294bb 100644
 --- a/agent/transports/hermes_tools_mcp_server.py
 +++ b/agent/transports/hermes_tools_mcp_server.py
 @@ -1,15 +1,13 @@
@@ -2223,7 +2244,7 @@ index 37f2d61..fab294b 100644
      return mcp
  
 diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
-index eb1c68f..3dd76a2 100644
+index eb1c68ff..3dd76a23 100644
 --- a/gateway/kanban_watchers.py
 +++ b/gateway/kanban_watchers.py
 @@ -15,6 +15,7 @@ import logging
@@ -2346,7 +2367,7 @@ index eb1c68f..3dd76a2 100644
                                  # Best-effort: the notification itself already
                                  # delivered and the cursor has advanced, so a
 diff --git a/gateway/run.py b/gateway/run.py
-index d5b3fbf..8494d8a 100644
+index d5b3fbff..8494d8a2 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -15087,6 +15087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
@@ -2358,7 +2379,7 @@ index d5b3fbf..8494d8a 100644
              profile=getattr(context.source, "profile", "") or "",
              async_delivery=_async_delivery,
 diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
-index a3a26b2..64b2ad8 100644
+index a3a26b26..64b2ad83 100644
 --- a/hermes_cli/runtime_provider.py
 +++ b/hermes_cli/runtime_provider.py
 @@ -340,6 +340,10 @@ _VALID_API_MODES = {
@@ -2411,7 +2432,7 @@ index a3a26b2..64b2ad8 100644
          base_url = base_url or OPENROUTER_BASE_URL
      elif provider == "xai":
 diff --git a/run_agent.py b/run_agent.py
-index fe378f3..1913c42 100644
+index fe378f39..1913c422 100644
 --- a/run_agent.py
 +++ b/run_agent.py
 @@ -2674,6 +2674,19 @@ class AIAgent:
@@ -2510,7 +2531,7 @@ index fe378f3..1913c42 100644
      query: str = None,
      model: str = "",
 diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
-index febdf53..4454af8 100644
+index febdf53a..4454af8c 100644
 --- a/tests/agent/test_anthropic_adapter.py
 +++ b/tests/agent/test_anthropic_adapter.py
 @@ -229,7 +229,7 @@ class TestReadClaudeCodeCredentials:
@@ -2610,7 +2631,7 @@ index febdf53..4454af8 100644
          monkeypatch.setattr("shutil.which", lambda _: None)
          with pytest.raises(FileNotFoundError, match="claude.*CLI.*not installed"):
 diff --git a/tests/agent/test_anthropic_keychain.py b/tests/agent/test_anthropic_keychain.py
-index 97faca0..7f05bc1 100644
+index 97faca04..7f05bc1e 100644
 --- a/tests/agent/test_anthropic_keychain.py
 +++ b/tests/agent/test_anthropic_keychain.py
 @@ -6,7 +6,11 @@ from unittest.mock import patch, MagicMock
@@ -2793,7 +2814,7 @@ index 97faca0..7f05bc1 100644
          assert captured["refresh_token"] == "live-refresh"
 -
 diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
-index 68a9233..c2d2ec6 100644
+index 68a92335..c2d2ec63 100644
 --- a/tests/agent/test_credential_pool.py
 +++ b/tests/agent/test_credential_pool.py
 @@ -1725,6 +1725,126 @@ def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path,
@@ -2924,7 +2945,7 @@ index 68a9233..c2d2ec6 100644
      """API-key auth path: autodiscovered OAuth creds must NOT be seeded.
  
 diff --git a/tests/agent/test_credential_pool_routing.py b/tests/agent/test_credential_pool_routing.py
-index 9c7c047..d1c99d9 100644
+index 9c7c0473..d1c99d99 100644
 --- a/tests/agent/test_credential_pool_routing.py
 +++ b/tests/agent/test_credential_pool_routing.py
 @@ -5,7 +5,7 @@ Covers:
@@ -2981,7 +3002,7 @@ index 9c7c047..d1c99d9 100644
          """Second consecutive 429 should rotate to next credential."""
 diff --git a/tests/agent/transports/test_claude_code_session.py b/tests/agent/transports/test_claude_code_session.py
 new file mode 100644
-index 0000000..e092b93
+index 00000000..e092b932
 --- /dev/null
 +++ b/tests/agent/transports/test_claude_code_session.py
 @@ -0,0 +1,320 @@
@@ -3306,7 +3327,7 @@ index 0000000..e092b93
 +        "browser"
 +    ]
 diff --git a/tests/agent/transports/test_hermes_tools_mcp_server.py b/tests/agent/transports/test_hermes_tools_mcp_server.py
-index c61e6c6..4815e77 100644
+index c61e6c68..4815e777 100644
 --- a/tests/agent/transports/test_hermes_tools_mcp_server.py
 +++ b/tests/agent/transports/test_hermes_tools_mcp_server.py
 @@ -46,15 +46,16 @@ class TestModuleSurface:
@@ -3437,7 +3458,7 @@ index c61e6c6..4815e77 100644
 +        ("mcp__example__lookup", {"query": "needle", "limit": 2})
 +    ]
 diff --git a/tests/gateway/test_kanban_notifier.py b/tests/gateway/test_kanban_notifier.py
-index 22c70e1..9605b5c 100644
+index 22c70e1c..9605b5c1 100644
 --- a/tests/gateway/test_kanban_notifier.py
 +++ b/tests/gateway/test_kanban_notifier.py
 @@ -1,19 +1,25 @@
@@ -3577,7 +3598,7 @@ index 22c70e1..9605b5c 100644
      db_path = tmp_path / "adapter-disconnect.db"
      monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
 diff --git a/tests/gateway/test_session_env.py b/tests/gateway/test_session_env.py
-index f5392ab..ffda4bb 100644
+index f5392ab2..ffda4bbd 100644
 --- a/tests/gateway/test_session_env.py
 +++ b/tests/gateway/test_session_env.py
 @@ -244,6 +244,36 @@ def test_set_session_env_includes_session_key():
@@ -3623,7 +3644,7 @@ index f5392ab..ffda4bb 100644
          runner._shutdown_executor()
 -
 diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
-index f2e65dd..fd9f106 100644
+index f2e65dd6..fd9f1064 100644
 --- a/tests/hermes_cli/test_auth_commands.py
 +++ b/tests/hermes_cli/test_auth_commands.py
 @@ -1811,6 +1811,15 @@ def test_credential_sources_find_step_returns_none_for_manual():
@@ -3644,7 +3665,7 @@ index f2e65dd..fd9f106 100644
      generic env-var step.  The copilot step handles the duplicate-source
 diff --git a/tests/run_agent/test_claude_code_runtime.py b/tests/run_agent/test_claude_code_runtime.py
 new file mode 100644
-index 0000000..e524f21
+index 00000000..e524f216
 --- /dev/null
 +++ b/tests/run_agent/test_claude_code_runtime.py
 @@ -0,0 +1,289 @@
@@ -3938,7 +3959,7 @@ index 0000000..e524f21
 +    assert result["partial"] is True
 +    agent._recover_with_credential_pool.assert_not_called()
 diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
-index afb45a5..3d6ebf7 100644
+index afb45a53..3d6ebf79 100644
 --- a/tests/run_agent/test_run_agent.py
 +++ b/tests/run_agent/test_run_agent.py
 @@ -2497,6 +2497,71 @@ class TestRetryAfterCap:
@@ -4069,7 +4090,7 @@ index afb45a5..3d6ebf7 100644
  
      def test_recover_with_pool_refreshes_on_401(self, agent):
 diff --git a/website/docs/user-guide/features/credential-pools.md b/website/docs/user-guide/features/credential-pools.md
-index 5d8503b..a4a5ea4 100644
+index 5d8503b3..a4a5ea45 100644
 --- a/website/docs/user-guide/features/credential-pools.md
 +++ b/website/docs/user-guide/features/credential-pools.md
 @@ -190,6 +190,43 @@ Hermes automatically discovers credentials from multiple sources and seeds the p
