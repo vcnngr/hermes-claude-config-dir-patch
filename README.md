@@ -38,6 +38,17 @@ Supported base:
 - Automatic rotation to another configured directory on auth/rate-limit errors,
   including an expired Claude Code OAuth session. A turn is never replayed
   after a native tool starts, preventing duplicate side effects.
+- Subscription caps reported as a *successful* turn are still rotated.
+  `claude -p` answers a capped account with exit `0`, `subtype: success`, and
+  the cap notice as its reply; untreated, the pool never sees a failure, the
+  notice reaches the user as an answer, and callers record the turn as `OK`.
+  A cap notice is recognised by sentence shape rather than by one wording, and
+  only when it opens a short message, so an agent discussing its own quota is
+  not mistaken for the cap.
+- A parsed reset time (`resets Jul 31 at 4am (Europe/Rome)`) is forwarded to
+  the pool, so a weekly cap freezes that row until it actually lifts instead of
+  re-entering the pool after the generic one-hour 429 cooldown. Unparsable or
+  implausible reset times fall back to that cooldown.
 
 Non-default source ids become `claude_code:<8-char-directory-hash>`. The
 default directory keeps `source: "claude_code"`.
@@ -73,7 +84,7 @@ GitHub also provides source ZIP and TAR archives on the release page.
 Patch SHA-256:
 
 ```text
-9de54923398502faf255a82e56a2c54e06d46fbc2f824cb2564b6de1f5456468
+fff28e857c27bb42e52b6a0053ea7b2dba05ae11b0c9ea246dbe0f8098bfd6c4
 ```
 
 ## Configure one Hermes profile
@@ -265,12 +276,12 @@ retire the downstream patch.
 
 ## Test result
 
-The two primary adapter/pool/runtime/MCP groups passed `698` tests on the
+The two primary adapter/pool/runtime/MCP groups passed `707` tests on the
 supported base. The credential-hydration group passed `342`; the focused
-gateway/Kanban/runtime group passed `158`. Groups overlap. Coverage includes
+gateway/Kanban/runtime group passed `167`. Groups overlap. Coverage includes
 real FastMCP schema dispatch, streaming, safe failover, interrupt, persistence,
-complete multi-block delivery, exact originating-session wake, and the
-no-double-execution boundary.
+complete multi-block delivery, exact originating-session wake, cap notices
+delivered as successful turns, and the no-double-execution boundary.
 
 The installer suite passed `11` tests. A clean temporary checkout at the exact
 supported commit completed install, status, Python compilation, `14` focused

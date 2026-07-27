@@ -57,6 +57,32 @@ selected pool entry
   -> classify 401/429 and rotate before tool execution only
 ```
 
+Cap classification is part of that last step. Claude Code does not fail when
+the account is capped: the turn ends `exit 0`, `subtype: success`,
+`is_error: false`, and the cap notice arrives as the assistant's reply. A
+reader keyed on `is_error` therefore treats a cap as a real answer, so
+`_is_limit_notice()` promotes such a turn to `429` before the rotation check:
+
+```text
+result payload
+  -> is_error or subtype != success        -> error, status from api_error_status
+  -> success but text is a cap notice      -> error, status 429
+  -> status 429                            -> parse reset instant from the text
+  -> forward message + reset_at to the credential pool
+```
+
+Detection matches the sentence *shape* (`you've hit/reached your <window>
+limit`, `usage limit reached`) because the wording tracks the cap window, and
+requires the notice to open a message of at most 300 characters. That bound is
+what separates the cap itself from an agent reasoning about its own quota.
+
+The parsed reset instant matters because the pool freezes an exhausted entry
+for a fixed TTL — one hour for a 429 — unless handed an absolute reset time.
+A weekly cap four days out would otherwise be re-selected hourly, each time at
+the cost of a failed turn. Parsing is best-effort and rejects any reset beyond
+a two-week horizon: returning nothing restores the TTL behaviour, while a
+misparse would freeze a working credential.
+
 For `~/.claude-work`:
 
 ```text
