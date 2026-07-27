@@ -3,11 +3,17 @@
 Small downstream patch adding multiple `CLAUDE_CONFIG_DIR` accounts to one
 Hermes Anthropic credential pool and a streaming official Claude Code runtime.
 
-Supported base:
+Supported bases:
 
 | Hermes | Upstream commit | Patch status |
 |---|---|---|
-| `v0.18.2 (2026.7.7.2)` | `226e8de8` | Tested |
+| `v0.19.0 (2026.7.20)` | `3ef6bbd2` | Tested, automated only |
+| `v0.18.2 (2026.7.7.2)` | `226e8de8` | Tested, live-validated |
+
+The installer selects the entry matching the checkout's exact `HEAD`, so both
+bases stay installable. `v0.18.2` additionally carries live end-to-end
+validation; `v0.19.0` has passed the full automated suite but has not yet
+served a live turn.
 
 ## What it adds
 
@@ -81,10 +87,11 @@ patch SHA-256, refuses overlapping checkout changes, and is idempotent. It
 does not download code at runtime or touch profile data during installation.
 GitHub also provides source ZIP and TAR archives on the release page.
 
-Patch SHA-256:
+Patch SHA-256, per base:
 
 ```text
-fff28e857c27bb42e52b6a0053ea7b2dba05ae11b0c9ea246dbe0f8098bfd6c4
+v0.18.2  fff28e857c27bb42e52b6a0053ea7b2dba05ae11b0c9ea246dbe0f8098bfd6c4
+v0.19.0  04ce19bf5c2268658d442761596b630be60bdb0469350b719b79894b24e1d91b
 ```
 
 ## Configure one Hermes profile

@@ -1,5 +1,36 @@
 # Testing
 
+## v0.19.0 port result
+
+Ported onto a throwaway clone of upstream `v2026.7.20` (`3ef6bbd2`); the local
+install stayed on `v0.18.2` throughout. Same four groups, run with the
+`v0.18.2` venv over `PYTHONPATH`:
+
+| Group | v0.18.2 | v0.19.0 |
+|---|---|---|
+| adapter/pool/runtime/MCP | `132` + `575` | `140` + `589` |
+| credential hydration | `342` | `348` |
+| gateway/Kanban/runtime | `167` | `190` |
+
+The higher counts are upstream's own added tests in the same files, not new
+downstream ones. `git apply --check` also passes forward on a pristine
+`v2026.7.20` checkout, which is the path the installer takes.
+
+Of 25 patched files, 24 applied unchanged. Only
+`agent/transports/hermes_tools_mcp_server.py` conflicted, 3 hunks of 11.
+
+One reconciliation is worth recording because a test caught it. Upstream
+independently solved the problem our `_apply_json_schema_signature()` existed
+for, via `_signature_from_schema()` — better, since it maps JSON types to
+Python types and sets annotations. Dropping our helper for theirs looks
+correct and is half right: their signature governs how FastMCP *invokes* the
+tool, while the schema FastMCP then derives from it is lossy — `minimum`,
+enum members, and descriptions do not survive the round-trip through Python
+annotations. `test_real_fastmcp_uses_authoritative_schema_and_normal_kwargs`
+fails on exactly that. The port therefore keeps upstream's signature synthesis
+*and* re-applies the post-registration `registered.parameters` override, which
+governs what the client sees. Both, not either.
+
 ## Automated regression suite
 
 Installer regression suite:
