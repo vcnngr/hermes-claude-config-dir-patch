@@ -36,8 +36,18 @@ venv/bin/pytest -q \
   tests/run_agent/test_run_agent.py
 ```
 
-Current result: `123 passed, 0 failed` and `575 passed, 0 failed` (`698`
+Current result: `132 passed, 0 failed` and `575 passed, 0 failed` (`707`
 total) across these two groups.
+
+Unset `CLAUDE_CONFIG_DIR` when running the credential-pool tests. Five tests in
+`tests/agent/test_credential_pool.py` assert that the default row is selected
+first and fail when the ambient shell exports a scoped directory, because the
+pool then discovers `claude_code:<hash8>` instead. This is host leakage, not a
+regression:
+
+```bash
+env -u CLAUDE_CONFIG_DIR venv/bin/pytest -q tests/agent/test_credential_pool.py
+```
 
 The older credential hydration regression set remains useful:
 
@@ -64,7 +74,7 @@ venv/bin/pytest -q \
   tests/run_agent/test_claude_code_runtime.py
 ```
 
-Current result: `158 passed, 0 failed`.
+Current result: `167 passed, 0 failed`.
 
 Coverage includes:
 
@@ -88,6 +98,12 @@ Runtime coverage includes:
 - active profile toolset propagation into the Hermes MCP bridge;
 - profile MCP, memory, session-search, kanban, and stateless tool exposure;
 - clean 401/429 credential rotation;
+- rotation when a subscription cap arrives as a successful `exit 0` turn, and
+  no rotation when an agent merely writes about its own quota;
+- reset-time parsing for dated, time-only, and year-crossing cap notices, with
+  a fallback to the pool cooldown on an unparsable or out-of-horizon reset;
+- a capped turn reported as failed, not completed, when no spare credential
+  remains;
 - no turn replay after native tool execution may have side effects;
 - subprocess interrupt/close handling and session persistence.
 - complete delivery when an answer precedes a control-tool/wakeup epilogue;

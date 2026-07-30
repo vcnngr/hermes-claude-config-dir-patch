@@ -5,7 +5,7 @@
       "hermes_version": "v0.18.2 (2026.7.7.2)",
       "upstream_commit": "226e8de827a669e8ffa7035b27d70c19e44b1208",
       "patch": "v0.18.2/hermes-claude-config-dir-multipool.patch",
-      "sha256": "9de54923398502faf255a82e56a2c54e06d46fbc2f824cb2564b6de1f5456468"
+      "sha256": "fff28e857c27bb42e52b6a0053ea7b2dba05ae11b0c9ea246dbe0f8098bfd6c4"
     }
   ]
 }

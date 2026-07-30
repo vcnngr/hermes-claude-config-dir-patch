@@ -590,10 +590,10 @@ index 689d0101..896a0baf 100644
          existing = {}
 diff --git a/agent/claude_runtime.py b/agent/claude_runtime.py
 new file mode 100644
-index 00000000..6aa0c94e
+index 00000000..e6f6ab6e
 --- /dev/null
 +++ b/agent/claude_runtime.py
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,431 @@
 +"""Claude Code external-agent runtime.
 +
 +This path bypasses Hermes' model/tool loop.  Claude Code receives the complete
@@ -929,6 +929,10 @@ index 00000000..6aa0c94e
 +            error_context={
 +                "message": turn.error,
 +                "reason": "claude_code_runtime",
++                # Absolute reset time when the notice carried one, so a weekly
++                # cap freezes the entry until it actually lifts instead of
++                # re-entering the pool after the generic 429 cooldown.
++                "reset_at": turn.rate_limit_reset_at,
 +            },
 +        )
 +        if not recovered:
@@ -1379,10 +1383,10 @@ index 18f0823b..78b26dd8 100644
      ))
 diff --git a/agent/transports/claude_code_session.py b/agent/transports/claude_code_session.py
 new file mode 100644
-index 00000000..5cb80808
+index 00000000..43fe764c
 --- /dev/null
 +++ b/agent/transports/claude_code_session.py
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,700 @@
 +"""Streaming Claude Code runtime for Hermes.
 +
 +Claude Code owns the agent loop and executes its native tools.  This module
@@ -1398,6 +1402,7 @@ index 00000000..5cb80808
 +import logging
 +import os
 +import queue
++import re
 +import shutil
 +import subprocess
 +import sys
@@ -1405,8 +1410,10 @@ index 00000000..5cb80808
 +import time
 +from collections import deque
 +from dataclasses import dataclass, field
++from datetime import datetime, timedelta, timezone
 +from pathlib import Path
 +from typing import Any, Callable, Optional
++from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 +
 +from agent.redact import redact_sensitive_text
 +from tools.environments.local import hermes_subprocess_env
@@ -1417,15 +1424,45 @@ index 00000000..5cb80808
 +_DEFAULT_TURN_TIMEOUT = 900.0
 +_STDERR_TAIL_LINES = 80
 +
++# Claude Code reports a subscription cap as prose, and the wording moves with
++# the cap window ("weekly limit", "5-hour limit", "usage limit reached").  A
++# keyword list keyed on one phrasing silently stops matching when the product
++# reworks the sentence, so match the sentence *shape* instead.
++_LIMIT_NOTICE_RE = re.compile(
++    r"(?:you['’]?ve|you\s+have)\s+(?:hit|reached)\s+your\s+(?:[\w.\-]+\s+){0,3}limit"
++    r"|(?:claude\s+)?usage\s+limit\s+reached",
++    re.IGNORECASE,
++)
++# A cap notice is a one-line status message.  An agent that merely *discusses*
++# its limits writes prose around the phrase, so cap the length before treating
++# a successful turn as a failure.
++_LIMIT_NOTICE_MAX_CHARS = 300
++_MONTH_NUMBERS = {
++    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
++    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
++}
++# "resets Jul 31 at 4am (Europe/Rome)", "Your limit will reset at 3pm".
++_RESET_AT_RE = re.compile(
++    r"reset(?:s|ting)?\s+(?:on\s+|at\s+)?"
++    r"(?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s+(?:at\s+)?)?"
++    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>am|pm)?"
++    r"(?:\s*\((?P<tz>[A-Za-z0-9_+\-/]+)\))?",
++    re.IGNORECASE,
++)
++# A misparse that lands far in the future would freeze a working credential,
++# which is worse than the cooldown it replaces.  Reject anything implausible.
++_MAX_RESET_HORIZON_SECONDS = 14 * 24 * 3600
++
 +
 +def _status_for_error(text: str) -> int:
 +    lower = (text or "").lower()
-+    if any(
++    if _LIMIT_NOTICE_RE.search(lower) or any(
 +        term in lower
 +        for term in (
 +            "rate limit",
 +            "usage limit",
 +            "hit your limit",
++            "weekly limit",
 +            "limit reached",
 +            "resets at",
 +            "error_max_budget",
@@ -1445,6 +1482,97 @@ index 00000000..5cb80808
 +    ):
 +        return 401
 +    return 500
++
++
++def _is_limit_notice(text: str) -> bool:
++    """True when a *successful* Claude turn is really a subscription cap notice.
++
++    ``claude -p`` does not fail when the account is capped.  It exits 0 and
++    emits ``{"type": "result", "subtype": "success", "is_error": false,
++    "result": "You've hit your weekly limit · resets Jul 31 at 4am"}`` — a
++    well-formed turn whose text happens to be the cap.  Callers that only look
++    at ``is_error`` therefore record a cap as a real answer: the credential
++    pool never sees a failure, never rotates, and the notice is delivered
++    verbatim as the agent's reply.
++
++    Matching is deliberately narrow.  The notice must *open* the message and
++    the message must be short, so an agent reasoning about its own quota
++    ("Opus subscription esaurita (weekly limit, reset 31 luglio). Due cose…")
++    is not mistaken for the cap itself.
++    """
++    stripped = (text or "").strip()
++    if not stripped or len(stripped) > _LIMIT_NOTICE_MAX_CHARS:
++        return False
++    return _LIMIT_NOTICE_RE.match(stripped) is not None
++
++
++def _reset_at_from_text(text: str, *, now: Optional[datetime] = None) -> Optional[float]:
++    """Parse the reset instant out of a cap notice, as epoch seconds.
++
++    The credential pool freezes an exhausted entry for a fixed TTL (one hour
++    for a 429) unless it is handed an absolute reset time.  A *weekly* cap
++    reset four days out would otherwise be retried hourly for four days,
++    burning a failed turn each time.  Returning ``None`` is always safe: the
++    caller falls back to the TTL.
++    """
++    if not text:
++        return None
++    match = _RESET_AT_RE.search(text)
++    if match is None:
++        return None
++
++    hour = int(match.group("hour"))
++    minute = int(match.group("minute") or 0)
++    meridiem = (match.group("meridiem") or "").lower()
++    if meridiem == "pm" and hour < 12:
++        hour += 12
++    elif meridiem == "am" and hour == 12:
++        hour = 0
++    if not (0 <= hour <= 23 and 0 <= minute <= 59):
++        return None
++
++    tzinfo: Any = None
++    tz_name = match.group("tz")
++    if tz_name:
++        try:
++            tzinfo = ZoneInfo(tz_name)
++        except (ZoneInfoNotFoundError, ValueError):
++            # Abbreviations such as "(PST)" are not IANA zones; the local
++            # clock is a better guess than discarding the reset time.
++            tzinfo = None
++    reference = (now or datetime.now(timezone.utc)).astimezone(tzinfo)
++
++    month_name = (match.group("month") or "").lower()[:3]
++    if month_name:
++        month = _MONTH_NUMBERS.get(month_name)
++        if month is None:
++            return None
++        try:
++            target = reference.replace(
++                month=month,
++                day=int(match.group("day")),
++                hour=hour,
++                minute=minute,
++                second=0,
++                microsecond=0,
++            )
++        except ValueError:
++            return None
++        if target < reference:
++            # A December cap that resets in January: same notice, next year.
++            try:
++                target = target.replace(year=target.year + 1)
++            except ValueError:
++                return None
++    else:
++        target = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
++        if target <= reference:
++            target += timedelta(days=1)
++
++    reset_at = target.timestamp()
++    if not 0 < reset_at - reference.timestamp() <= _MAX_RESET_HORIZON_SECONDS:
++        return None
++    return reset_at
 +
 +
 +def _render_content(content: Any, *, limit: int = 12000) -> str:
@@ -1529,6 +1657,7 @@ index 00000000..5cb80808
 +    tool_iterations: int = 0
 +    error: Optional[str] = None
 +    status_code: Optional[int] = None
++    rate_limit_reset_at: Optional[float] = None
 +    interrupted: bool = False
 +    should_retire: bool = False
 +    side_effects_possible: bool = False
@@ -1910,6 +2039,16 @@ index 00000000..5cb80808
 +                        payload.get("api_error_status")
 +                        or _status_for_error(f"{subtype} {result.error}")
 +                    )
++                elif _is_limit_notice(result.final_text):
++                    # A capped account still exits 0 with subtype=success.
++                    # Promote it to a 429 so the credential pool can rotate;
++                    # left alone, the cap is served to the user as an answer.
++                    result.error = result.final_text
++                    result.status_code = 429
++                if result.status_code == 429:
++                    result.rate_limit_reset_at = _reset_at_from_text(
++                        result.final_text
++                    )
 +
 +        try:
 +            return_code = proc.wait(timeout=5)
@@ -1931,6 +2070,8 @@ index 00000000..5cb80808
 +            )
 +            result.error = safe_error[-4000:]
 +            result.status_code = _status_for_error(result.error)
++            if result.status_code == 429:
++                result.rate_limit_reset_at = _reset_at_from_text(result.error)
 +            result.should_retire = True
 +        elif not saw_result and result.error is None:
 +            result.error = "Claude Code stream ended without a result message"
@@ -3002,17 +3143,20 @@ index 9c7c0473..d1c99d99 100644
          """Second consecutive 429 should rotate to next credential."""
 diff --git a/tests/agent/transports/test_claude_code_session.py b/tests/agent/transports/test_claude_code_session.py
 new file mode 100644
-index 00000000..e092b932
+index 00000000..8b3518fb
 --- /dev/null
 +++ b/tests/agent/transports/test_claude_code_session.py
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,429 @@
 +from __future__ import annotations
 +
 +import json
++from datetime import datetime
++from zoneinfo import ZoneInfo
 +
 +from agent.transports.claude_code_session import (
 +    ClaudeCodeSession,
 +    ClaudeEventProjector,
++    _reset_at_from_text,
 +    build_turn_prompt,
 +)
 +
@@ -3246,6 +3390,112 @@ index 00000000..e092b932
 +
 +    assert result.status_code == 429
 +    assert "usage limit" in result.error
++
++
++def _run_single_result_turn(monkeypatch, tmp_path, payload):
++    process = _FakeProcess([_line(payload)], returncode=0)
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.shutil.which",
++        lambda _: "/usr/bin/claude",
++    )
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.subprocess.Popen",
++        lambda *args, **kwargs: process,
++    )
++    session = ClaudeCodeSession(
++        claude_config_dir=str(tmp_path / "claude-account"),
++        cwd=str(tmp_path),
++        model="claude-test",
++        expose_hermes_tools=False,
++    )
++    return session.run_turn(prompt="hello")
++
++
++def test_capped_account_reported_as_a_successful_turn_maps_to_429(monkeypatch, tmp_path):
++    # Verbatim shape emitted by ``claude -p`` on a weekly subscription cap:
++    # exit 0, subtype success, no is_error — the cap arrives as the answer.
++    result = _run_single_result_turn(
++        monkeypatch,
++        tmp_path,
++        {
++            "type": "result",
++            "subtype": "success",
++            "is_error": False,
++            "result": "You've hit your weekly limit · resets Jul 31 at 4am (Europe/Rome)",
++        },
++    )
++
++    assert result.status_code == 429
++    assert result.error == (
++        "You've hit your weekly limit · resets Jul 31 at 4am (Europe/Rome)"
++    )
++
++
++def test_agent_prose_about_its_own_cap_stays_a_successful_turn(monkeypatch, tmp_path):
++    # An agent discussing the cap must not cost its credential a rotation.
++    answer = (
++        "Opus subscription esaurita (weekly limit, reset 31 luglio). Due cose: "
++        "il runner ha registrato OK su un messaggio di limite, e serve il quarto "
++        "annotatore."
++    )
++    result = _run_single_result_turn(
++        monkeypatch,
++        tmp_path,
++        {"type": "result", "subtype": "success", "is_error": False, "result": answer},
++    )
++
++    assert result.error is None
++    assert result.status_code is None
++    assert result.final_text == answer
++
++
++def test_reset_at_parses_a_dated_cap_notice():
++    now = datetime(2026, 7, 27, 21, 40, tzinfo=ZoneInfo("Europe/Rome"))
++
++    reset_at = _reset_at_from_text(
++        "You've hit your weekly limit · resets Jul 31 at 4am (Europe/Rome)",
++        now=now,
++    )
++
++    assert reset_at == datetime(
++        2026, 7, 31, 4, 0, tzinfo=ZoneInfo("Europe/Rome")
++    ).timestamp()
++
++
++def test_reset_at_rolls_forward_when_the_hour_already_passed():
++    now = datetime(2026, 7, 27, 21, 40, tzinfo=ZoneInfo("Europe/Rome"))
++
++    reset_at = _reset_at_from_text(
++        "Claude usage limit reached. Your limit will reset at 3pm (Europe/Rome)",
++        now=now,
++    )
++
++    assert reset_at == datetime(
++        2026, 7, 28, 15, 0, tzinfo=ZoneInfo("Europe/Rome")
++    ).timestamp()
++
++
++def test_reset_at_rolls_over_the_year_boundary():
++    now = datetime(2026, 12, 30, 23, 0, tzinfo=ZoneInfo("Europe/Rome"))
++
++    reset_at = _reset_at_from_text("resets Jan 2 at 4am (Europe/Rome)", now=now)
++
++    assert reset_at == datetime(
++        2027, 1, 2, 4, 0, tzinfo=ZoneInfo("Europe/Rome")
++    ).timestamp()
++
++
++def test_reset_at_rejects_an_implausibly_distant_reset():
++    # Freezing a credential for a year on a misparse is worse than the
++    # cooldown it replaces, so an out-of-horizon reset falls back to the TTL.
++    now = datetime(2026, 1, 2, 9, 0, tzinfo=ZoneInfo("Europe/Rome"))
++
++    assert _reset_at_from_text("resets Dec 31 at 4am (Europe/Rome)", now=now) is None
++
++
++def test_reset_at_is_none_without_a_reset_clause():
++    assert _reset_at_from_text("You've hit your weekly limit") is None
++    assert _reset_at_from_text("") is None
 +
 +
 +def test_projector_keeps_tool_results_as_history_only():
@@ -3665,10 +3915,10 @@ index f2e65dd6..fd9f1064 100644
      generic env-var step.  The copilot step handles the duplicate-source
 diff --git a/tests/run_agent/test_claude_code_runtime.py b/tests/run_agent/test_claude_code_runtime.py
 new file mode 100644
-index 00000000..e524f216
+index 00000000..3ee061e1
 --- /dev/null
 +++ b/tests/run_agent/test_claude_code_runtime.py
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,362 @@
 +from __future__ import annotations
 +
 +from pathlib import Path
@@ -3923,6 +4173,79 @@ index 00000000..e524f216
 +        for path in config_dirs
 +    ]
 +    agent._recover_with_credential_pool.assert_called_once()
++
++
++def test_capped_success_turn_rotates_and_forwards_the_reset_time(monkeypatch):
++    """A weekly cap must rotate, and must freeze the entry until it lifts.
++
++    Regression for the production failure: ``claude -p`` returned the cap as a
++    successful turn, the pool never saw a 429, and the notice was delivered as
++    the agent's answer.
++    """
++    config_dirs = ["/tmp/claude-capped", "/tmp/claude-spare"]
++    reset_at = 1785700800.0
++
++    monkeypatch.setattr(
++        "agent.claude_runtime._selected_claude_setup_token",
++        lambda config_dir: f"token:{Path(config_dir).name}",
++    )
++
++    def fake_run_turn(self, *, prompt, timeout=900.0):
++        if self.claude_config_dir.endswith("claude-capped"):
++            notice = "You've hit your weekly limit · resets Jul 31 at 4am (Europe/Rome)"
++            return ClaudeTurnResult(
++                final_text=notice,
++                error=notice,
++                status_code=429,
++                rate_limit_reset_at=reset_at,
++            )
++        return ClaudeTurnResult(
++            final_text="annotated",
++            projected_messages=[{"role": "assistant", "content": "annotated"}],
++        )
++
++    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
++    agent = _make_agent()
++    pool = MagicMock()
++    pool.entries.return_value = [SimpleNamespace(), SimpleNamespace()]
++    agent._credential_pool = pool
++    agent._client_kwargs["claude_config_dir"] = config_dirs[0]
++
++    def recover(**kwargs):
++        agent._client_kwargs["claude_config_dir"] = config_dirs[1]
++        return True, False
++
++    agent._recover_with_credential_pool = MagicMock(side_effect=recover)
++    with patch.object(agent, "_spawn_background_review", return_value=None):
++        result = agent.run_conversation("annotate")
++
++    assert result["completed"] is True
++    assert result["final_response"] == "annotated"
++    agent._recover_with_credential_pool.assert_called_once()
++    error_context = agent._recover_with_credential_pool.call_args.kwargs["error_context"]
++    assert error_context["reset_at"] == reset_at
++    assert error_context["reason"] == "claude_code_runtime"
++
++
++def test_capped_turn_without_a_spare_credential_reports_failure(monkeypatch):
++    """With the pool dry the cap still must not read as a completed turn."""
++    notice = "You've hit your weekly limit · resets Jul 31 at 4am (Europe/Rome)"
++
++    def fake_run_turn(self, *, prompt, timeout=900.0):
++        return ClaudeTurnResult(final_text=notice, error=notice, status_code=429)
++
++    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
++    agent = _make_agent()
++    pool = MagicMock()
++    pool.entries.return_value = [SimpleNamespace()]
++    agent._credential_pool = pool
++    agent._recover_with_credential_pool = MagicMock(return_value=(False, True))
++
++    result = agent.run_conversation("annotate")
++
++    assert result["completed"] is False
++    assert result["partial"] is True
++    assert result["error"] == notice
 +
 +
 +def test_failover_never_replays_after_native_tool_started(monkeypatch):
