@@ -1383,10 +1383,10 @@ index 18f0823..78b26dd 100644
      ))
 diff --git a/agent/transports/claude_code_session.py b/agent/transports/claude_code_session.py
 new file mode 100644
-index 0000000..43fe764
+index 0000000..39e1d17
 --- /dev/null
 +++ b/agent/transports/claude_code_session.py
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,765 @@
 +"""Streaming Claude Code runtime for Hermes.
 +
 +Claude Code owns the agent loop and executes its native tools.  This module
@@ -1421,7 +1421,17 @@ index 0000000..43fe764
 +
 +logger = logging.getLogger(__name__)
 +
-+_DEFAULT_TURN_TIMEOUT = 900.0
++# How long the turn may go *silent* before we treat it as wedged. Claude Code
++# streams continuously — token deltas, tool starts, tool_progress heartbeats —
++# so any healthy turn, however long, refreshes this budget. A turn that stops
++# emitting for this long is not slow, it is stuck.
++_DEFAULT_IDLE_TIMEOUT = 900.0
++# Absolute ceiling, refreshed by nothing. Needed because idleness alone cannot
++# see a wedged turn: a tool stuck in a loop still emits tool_progress, which
++# would refresh the idle budget forever. Aligned with the largest Kanban card
++# budget actually in use, so a card is no longer handed a runtime allowance its
++# own turns cannot spend.
++_DEFAULT_TURN_TIMEOUT = 3600.0
 +_STDERR_TAIL_LINES = 80
 +
 +# Claude Code reports a subscription cap as prose, and the wording moves with
@@ -1639,6 +1649,22 @@ index 0000000..43fe764
 +    if transcript:
 +        sections.append("CONVERSATION TRANSCRIPT:\n" + "\n\n".join(transcript))
 +    return "\n\n".join(sections)
++
++
++def _last_assistant_text(messages: list[dict[str, Any]]) -> str:
++    """Return the newest projected assistant prose, or "" if there is none.
++
++    Assistant entries that only carry tool_calls have no prose worth
++    delivering, so they are skipped in favour of the last one that actually
++    said something.
++    """
++    for message in reversed(messages or []):
++        if not isinstance(message, dict) or message.get("role") != "assistant":
++            continue
++        content = message.get("content")
++        if isinstance(content, str) and content.strip():
++            return content.strip()
++    return ""
 +
 +
 +def _tool_result_text(block: dict[str, Any]) -> str:
@@ -1871,6 +1897,7 @@ index 0000000..43fe764
 +        *,
 +        prompt: str,
 +        timeout: float = _DEFAULT_TURN_TIMEOUT,
++        idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
 +    ) -> ClaudeTurnResult:
 +        result = ClaudeTurnResult()
 +        projector = ClaudeEventProjector()
@@ -1930,14 +1957,24 @@ index 0000000..43fe764
 +            result.status_code = 500
 +            result.should_retire = True
 +
-+        deadline = time.monotonic() + max(float(timeout), 1.0)
++        idle_budget = max(float(idle_timeout), 1.0)
++        hard_deadline = time.monotonic() + max(float(timeout), 1.0)
++        idle_deadline = time.monotonic() + idle_budget
 +        reached_eof = False
 +        while not reached_eof and result.error is None:
 +            if self._interrupt_event.is_set():
 +                result.interrupted = True
 +                break
-+            if time.monotonic() >= deadline:
-+                result.error = f"Claude Code turn timed out after {timeout:.0f}s"
++            now = time.monotonic()
++            expiry = "silent" if now >= idle_deadline else None
++            if now >= hard_deadline:
++                expiry = "hard"
++            if expiry is not None:
++                if expiry == "silent":
++                    reason = f"went silent for {idle_budget:.0f}s"
++                else:
++                    reason = f"exceeded its {timeout:.0f}s ceiling"
++                result.error = f"Claude Code turn {reason}"
 +                result.status_code = 504
 +                result.interrupted = True
 +                result.should_retire = True
@@ -1949,6 +1986,10 @@ index 0000000..43fe764
 +                if proc.poll() is not None and not stdout_thread.is_alive():
 +                    reached_eof = True
 +                continue
++            # Any byte from Claude is proof of life: token deltas, tool starts,
++            # tool_progress heartbeats. Refresh the silence budget, never the
++            # ceiling.
++            idle_deadline = time.monotonic() + idle_budget
 +            if item_type == "eof":
 +                reached_eof = True
 +                continue
@@ -2049,6 +2090,11 @@ index 0000000..43fe764
 +                    result.rate_limit_reset_at = _reset_at_from_text(
 +                        result.final_text
 +                    )
++                # `result` is terminal in the stream-json protocol. Waiting for
++                # EOF past it means a finished turn whose process is slow to
++                # exit can still trip a deadline and be reported as a failure,
++                # discarding an answer we already hold.
++                break
 +
 +        try:
 +            return_code = proc.wait(timeout=5)
@@ -2077,6 +2123,25 @@ index 0000000..43fe764
 +            result.error = "Claude Code stream ended without a result message"
 +            result.status_code = 500
 +            result.should_retire = True
++
++        if result.error is not None and not result.final_text:
++            # A turn cut short never emits its `result` payload, so final_text
++            # is empty and the caller delivers the bare error string — fifteen
++            # minutes of tool work reaching the user as one line of failure.
++            # The work itself is not lost: completed assistant turns were
++            # already projected. Promote the last one so the caller has
++            # something real to deliver. Mirrors the upstream fix for the same
++            # defect on the sibling Codex runtime (NousResearch/hermes-agent
++            # #58432), which accepts already-completed assistant text at the
++            # deadline instead of discarding it.
++            #
++            # The error stays set: unlike upstream's case (a complete answer
++            # missing only its completion event) a cut turn may have stopped
++            # mid-thought, so this is salvage, not success. The caller still
++            # sees a failed, partial turn — it just also sees the work.
++            salvaged = _last_assistant_text(result.projected_messages)
++            if salvaged:
++                result.final_text = f"{salvaged}\n\n[{result.error}]"
 +
 +        return result
 +
@@ -3101,13 +3166,14 @@ index a23c228..243366c 100644
          """Second consecutive 429 should rotate to next credential."""
 diff --git a/tests/agent/transports/test_claude_code_session.py b/tests/agent/transports/test_claude_code_session.py
 new file mode 100644
-index 0000000..8b3518f
+index 0000000..4a98d11
 --- /dev/null
 +++ b/tests/agent/transports/test_claude_code_session.py
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,561 @@
 +from __future__ import annotations
 +
 +import json
++import time
 +from datetime import datetime
 +from zoneinfo import ZoneInfo
 +
@@ -3157,6 +3223,137 @@ index 0000000..8b3518f
 +    def kill(self):
 +        self.killed = True
 +        self.returncode = -9
++
++
++class _ScheduledProcess:
++    """Fake claude process whose stdout arrives on a schedule.
++
++    Unlike _FakeProcess it stays alive after its last line, so a turn can be
++    observed going silent without the stream reaching EOF.
++    """
++
++    def __init__(self, timed_lines):
++        self.stdin = _FakeInput()
++        self.stderr = []
++        self.returncode = 0
++        self.terminated = False
++        self.killed = False
++        self.stdout = self._emit(list(timed_lines))
++
++    def _emit(self, timed_lines):
++        for delay, line in timed_lines:
++            time.sleep(delay)
++            if self._stopped():
++                return
++            yield line
++        while not self._stopped():
++            time.sleep(0.02)
++
++    def _stopped(self):
++        return self.terminated or self.killed
++
++    def poll(self):
++        return self.returncode if self._stopped() else None
++
++    def wait(self, timeout=None):
++        return self.returncode
++
++    def terminate(self):
++        self.terminated = True
++        self.returncode = -15
++
++    def kill(self):
++        self.killed = True
++        self.returncode = -9
++
++
++def _session_over(monkeypatch, tmp_path, process):
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.shutil.which",
++        lambda _: "/usr/bin/claude",
++    )
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.subprocess.Popen",
++        lambda *args, **kwargs: process,
++    )
++    return ClaudeCodeSession(
++        claude_config_dir=str(tmp_path / "claude-account"),
++        cwd=str(tmp_path),
++        model="claude-test",
++        expose_hermes_tools=False,
++    )
++
++
++def test_silent_turn_is_cut_by_the_idle_budget(monkeypatch, tmp_path):
++    process = _ScheduledProcess([])
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=30.0, idle_timeout=1.0)
++
++    assert result.status_code == 504
++    assert "went silent for 1s" in result.error
++    assert result.should_retire is True
++    assert process.terminated is True
++
++
++def test_streaming_activity_refreshes_the_idle_budget(monkeypatch, tmp_path):
++    # Streams for ~2s with no gap wider than 0.2s. Under the old wall-clock
++    # deadline this turn died; it must now survive, because it is never silent.
++    lines = [(0.2, _line({"type": "stream_event", "event": {}})) for _ in range(10)]
++    lines.append(
++        (0.05, _line({"type": "result", "subtype": "success", "result": "done"}))
++    )
++    process = _ScheduledProcess(lines)
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=30.0, idle_timeout=1.0)
++
++    assert result.error is None
++    assert result.final_text == "done"
++    assert process.terminated is False
++
++
++def test_ceiling_still_cuts_a_turn_that_never_goes_silent(monkeypatch, tmp_path):
++    # A wedged tool keeps emitting progress, so the idle budget never expires.
++    # Only the absolute ceiling can end this turn.
++    lines = [(0.05, _line({"type": "tool_progress", "tool_name": "Bash"}))] * 200
++    process = _ScheduledProcess(lines)
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=1.0, idle_timeout=30.0)
++
++    assert result.status_code == 504
++    assert "exceeded its 1s ceiling" in result.error
++    assert process.terminated is True
++
++
++def test_cut_turn_delivers_the_work_it_already_produced(monkeypatch, tmp_path):
++    # Regression for the production symptom: a turn cut after real work
++    # reached the user as a bare 37-character error string.
++    answer = "Merged three PRs and pushed the spanset spec."
++    process = _ScheduledProcess(
++        [
++            (
++                0.05,
++                _line(
++                    {
++                        "type": "assistant",
++                        "message": {
++                            "role": "assistant",
++                            "content": [{"type": "text", "text": answer}],
++                        },
++                    }
++                ),
++            )
++        ]
++    )
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=30.0, idle_timeout=1.0)
++
++    assert result.error is not None
++    assert answer in result.final_text
++    assert result.error in result.final_text
 +
 +
 +def test_streams_text_and_projects_native_tool_history(monkeypatch, tmp_path):

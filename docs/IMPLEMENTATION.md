@@ -57,6 +57,33 @@ selected pool entry
   -> classify 401/429 and rotate before tool execution only
 ```
 
+Turn bounding sits in the same read loop. Two budgets run in parallel:
+
+```text
+idle_deadline   refreshed by every byte Claude emits   default  900s
+hard_deadline   refreshed by nothing                   default 3600s
+```
+
+Neither is sufficient alone. A wall-clock-only budget kills healthy long work,
+which is what the original single deadline did — it was set once before the
+loop and never reset. An idleness-only budget can never see a wedged turn,
+because a tool stuck in a loop still emits `tool_progress` heartbeats that
+would refresh it forever. The ceiling is aligned with the largest Kanban card
+budget in real use, so a card is no longer handed a runtime allowance its own
+turns cannot spend.
+
+The terminal `result` payload ends the loop immediately rather than waiting for
+stream EOF. Waiting past it means a finished turn whose process is slow to exit
+can still trip a deadline and be reported as a failure, discarding an answer
+already held — the defect upstream fixed for the sibling runtime in #58432.
+
+When a turn does end early it never emitted `result`, so `final_text` is empty
+and the caller would deliver only the error string. The last completed
+assistant message is promoted into `final_text` with the reason appended. The
+error stays set: unlike upstream's case — a complete answer missing only its
+completion event — a cut turn may have stopped mid-thought, so this is salvage,
+not success, and the caller still sees a failed partial turn.
+
 Cap classification is part of that last step. Claude Code does not fail when
 the account is capped: the turn ends `exit 0`, `subtype: success`,
 `is_error: false`, and the cap notice arrives as the assistant's reply. A

@@ -1,5 +1,5 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index c5826b4b..98570e31 100644
+index c5826b4b9..98570e31f 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -449,7 +449,7 @@ def init_agent(
@@ -42,7 +42,7 @@ index c5826b4b..98570e31 100644
          # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
          # Region is extracted from the base_url or defaults to us-east-1.
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 1cde7341..39419149 100644
+index 1cde73419..394191493 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -704,8 +704,8 @@ def recover_with_credential_pool(
@@ -93,7 +93,7 @@ index 1cde7341..39419149 100644
          # but refresh cannot fix them — the OAuth token is already valid,
          # the account simply lacks the entitlement.  Without this guard,
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
-index 689d0101..896a0baf 100644
+index 689d01010..896a0bafd 100644
 --- a/agent/anthropic_adapter.py
 +++ b/agent/anthropic_adapter.py
 @@ -11,6 +11,7 @@ Auth supports:
@@ -590,7 +590,7 @@ index 689d0101..896a0baf 100644
          existing = {}
 diff --git a/agent/claude_runtime.py b/agent/claude_runtime.py
 new file mode 100644
-index 00000000..e6f6ab6e
+index 000000000..e6f6ab6ef
 --- /dev/null
 +++ b/agent/claude_runtime.py
 @@ -0,0 +1,431 @@
@@ -1026,7 +1026,7 @@ index 00000000..e6f6ab6e
 +
 +__all__ = ["run_claude_code_turn"]
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 12c80a8b..72bfbe6b 100644
+index 12c80a8bf..72bfbe6ba 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
 @@ -640,6 +640,18 @@ def run_conversation(
@@ -1049,7 +1049,7 @@ index 12c80a8b..72bfbe6b 100644
          # Reset per-turn checkpoint dedup so each iteration can take one snapshot
          agent._checkpoint_mgr.new_turn()
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
-index 3bd59493..b25158ba 100644
+index 3bd594935..b25158ba2 100644
 --- a/agent/credential_pool.py
 +++ b/agent/credential_pool.py
 @@ -125,9 +125,15 @@ _EXTRA_KEYS = frozenset({
@@ -1357,7 +1357,7 @@ index 3bd59493..b25158ba 100644
      elif provider == "nous":
          state = _load_provider_state(auth_store, "nous")
 diff --git a/agent/credential_sources.py b/agent/credential_sources.py
-index 18f0823b..78b26dd8 100644
+index 18f0823ba..78b26dd8c 100644
 --- a/agent/credential_sources.py
 +++ b/agent/credential_sources.py
 @@ -197,9 +197,10 @@ def _remove_claude_code(provider: str, removed) -> RemovalResult:
@@ -1383,10 +1383,10 @@ index 18f0823b..78b26dd8 100644
      ))
 diff --git a/agent/transports/claude_code_session.py b/agent/transports/claude_code_session.py
 new file mode 100644
-index 00000000..43fe764c
+index 000000000..39e1d17e8
 --- /dev/null
 +++ b/agent/transports/claude_code_session.py
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,765 @@
 +"""Streaming Claude Code runtime for Hermes.
 +
 +Claude Code owns the agent loop and executes its native tools.  This module
@@ -1421,7 +1421,17 @@ index 00000000..43fe764c
 +
 +logger = logging.getLogger(__name__)
 +
-+_DEFAULT_TURN_TIMEOUT = 900.0
++# How long the turn may go *silent* before we treat it as wedged. Claude Code
++# streams continuously — token deltas, tool starts, tool_progress heartbeats —
++# so any healthy turn, however long, refreshes this budget. A turn that stops
++# emitting for this long is not slow, it is stuck.
++_DEFAULT_IDLE_TIMEOUT = 900.0
++# Absolute ceiling, refreshed by nothing. Needed because idleness alone cannot
++# see a wedged turn: a tool stuck in a loop still emits tool_progress, which
++# would refresh the idle budget forever. Aligned with the largest Kanban card
++# budget actually in use, so a card is no longer handed a runtime allowance its
++# own turns cannot spend.
++_DEFAULT_TURN_TIMEOUT = 3600.0
 +_STDERR_TAIL_LINES = 80
 +
 +# Claude Code reports a subscription cap as prose, and the wording moves with
@@ -1639,6 +1649,22 @@ index 00000000..43fe764c
 +    if transcript:
 +        sections.append("CONVERSATION TRANSCRIPT:\n" + "\n\n".join(transcript))
 +    return "\n\n".join(sections)
++
++
++def _last_assistant_text(messages: list[dict[str, Any]]) -> str:
++    """Return the newest projected assistant prose, or "" if there is none.
++
++    Assistant entries that only carry tool_calls have no prose worth
++    delivering, so they are skipped in favour of the last one that actually
++    said something.
++    """
++    for message in reversed(messages or []):
++        if not isinstance(message, dict) or message.get("role") != "assistant":
++            continue
++        content = message.get("content")
++        if isinstance(content, str) and content.strip():
++            return content.strip()
++    return ""
 +
 +
 +def _tool_result_text(block: dict[str, Any]) -> str:
@@ -1871,6 +1897,7 @@ index 00000000..43fe764c
 +        *,
 +        prompt: str,
 +        timeout: float = _DEFAULT_TURN_TIMEOUT,
++        idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
 +    ) -> ClaudeTurnResult:
 +        result = ClaudeTurnResult()
 +        projector = ClaudeEventProjector()
@@ -1930,14 +1957,24 @@ index 00000000..43fe764c
 +            result.status_code = 500
 +            result.should_retire = True
 +
-+        deadline = time.monotonic() + max(float(timeout), 1.0)
++        idle_budget = max(float(idle_timeout), 1.0)
++        hard_deadline = time.monotonic() + max(float(timeout), 1.0)
++        idle_deadline = time.monotonic() + idle_budget
 +        reached_eof = False
 +        while not reached_eof and result.error is None:
 +            if self._interrupt_event.is_set():
 +                result.interrupted = True
 +                break
-+            if time.monotonic() >= deadline:
-+                result.error = f"Claude Code turn timed out after {timeout:.0f}s"
++            now = time.monotonic()
++            expiry = "silent" if now >= idle_deadline else None
++            if now >= hard_deadline:
++                expiry = "hard"
++            if expiry is not None:
++                if expiry == "silent":
++                    reason = f"went silent for {idle_budget:.0f}s"
++                else:
++                    reason = f"exceeded its {timeout:.0f}s ceiling"
++                result.error = f"Claude Code turn {reason}"
 +                result.status_code = 504
 +                result.interrupted = True
 +                result.should_retire = True
@@ -1949,6 +1986,10 @@ index 00000000..43fe764c
 +                if proc.poll() is not None and not stdout_thread.is_alive():
 +                    reached_eof = True
 +                continue
++            # Any byte from Claude is proof of life: token deltas, tool starts,
++            # tool_progress heartbeats. Refresh the silence budget, never the
++            # ceiling.
++            idle_deadline = time.monotonic() + idle_budget
 +            if item_type == "eof":
 +                reached_eof = True
 +                continue
@@ -2049,6 +2090,11 @@ index 00000000..43fe764c
 +                    result.rate_limit_reset_at = _reset_at_from_text(
 +                        result.final_text
 +                    )
++                # `result` is terminal in the stream-json protocol. Waiting for
++                # EOF past it means a finished turn whose process is slow to
++                # exit can still trip a deadline and be reported as a failure,
++                # discarding an answer we already hold.
++                break
 +
 +        try:
 +            return_code = proc.wait(timeout=5)
@@ -2078,6 +2124,25 @@ index 00000000..43fe764c
 +            result.status_code = 500
 +            result.should_retire = True
 +
++        if result.error is not None and not result.final_text:
++            # A turn cut short never emits its `result` payload, so final_text
++            # is empty and the caller delivers the bare error string — fifteen
++            # minutes of tool work reaching the user as one line of failure.
++            # The work itself is not lost: completed assistant turns were
++            # already projected. Promote the last one so the caller has
++            # something real to deliver. Mirrors the upstream fix for the same
++            # defect on the sibling Codex runtime (NousResearch/hermes-agent
++            # #58432), which accepts already-completed assistant text at the
++            # deadline instead of discarding it.
++            #
++            # The error stays set: unlike upstream's case (a complete answer
++            # missing only its completion event) a cut turn may have stopped
++            # mid-thought, so this is salvage, not success. The caller still
++            # sees a failed, partial turn — it just also sees the work.
++            salvaged = _last_assistant_text(result.projected_messages)
++            if salvaged:
++                result.final_text = f"{salvaged}\n\n[{result.error}]"
++
 +        return result
 +
 +
@@ -2088,7 +2153,7 @@ index 00000000..43fe764c
 +    "build_turn_prompt",
 +]
 diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
-index 37f2d617..fab294bb 100644
+index 37f2d6179..fab294bb6 100644
 --- a/agent/transports/hermes_tools_mcp_server.py
 +++ b/agent/transports/hermes_tools_mcp_server.py
 @@ -1,15 +1,13 @@
@@ -2385,7 +2450,7 @@ index 37f2d617..fab294bb 100644
      return mcp
  
 diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
-index eb1c68ff..3dd76a23 100644
+index eb1c68ffd..3dd76a23e 100644
 --- a/gateway/kanban_watchers.py
 +++ b/gateway/kanban_watchers.py
 @@ -15,6 +15,7 @@ import logging
@@ -2508,7 +2573,7 @@ index eb1c68ff..3dd76a23 100644
                                  # Best-effort: the notification itself already
                                  # delivered and the cursor has advanced, so a
 diff --git a/gateway/run.py b/gateway/run.py
-index d5b3fbff..8494d8a2 100644
+index d5b3fbff4..8494d8a2d 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -15087,6 +15087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
@@ -2520,7 +2585,7 @@ index d5b3fbff..8494d8a2 100644
              profile=getattr(context.source, "profile", "") or "",
              async_delivery=_async_delivery,
 diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
-index a3a26b26..64b2ad83 100644
+index a3a26b268..64b2ad839 100644
 --- a/hermes_cli/runtime_provider.py
 +++ b/hermes_cli/runtime_provider.py
 @@ -340,6 +340,10 @@ _VALID_API_MODES = {
@@ -2573,7 +2638,7 @@ index a3a26b26..64b2ad83 100644
          base_url = base_url or OPENROUTER_BASE_URL
      elif provider == "xai":
 diff --git a/run_agent.py b/run_agent.py
-index fe378f39..1913c422 100644
+index fe378f396..1913c4221 100644
 --- a/run_agent.py
 +++ b/run_agent.py
 @@ -2674,6 +2674,19 @@ class AIAgent:
@@ -2672,7 +2737,7 @@ index fe378f39..1913c422 100644
      query: str = None,
      model: str = "",
 diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
-index febdf53a..4454af8c 100644
+index febdf53a3..4454af8c9 100644
 --- a/tests/agent/test_anthropic_adapter.py
 +++ b/tests/agent/test_anthropic_adapter.py
 @@ -229,7 +229,7 @@ class TestReadClaudeCodeCredentials:
@@ -2772,7 +2837,7 @@ index febdf53a..4454af8c 100644
          monkeypatch.setattr("shutil.which", lambda _: None)
          with pytest.raises(FileNotFoundError, match="claude.*CLI.*not installed"):
 diff --git a/tests/agent/test_anthropic_keychain.py b/tests/agent/test_anthropic_keychain.py
-index 97faca04..7f05bc1e 100644
+index 97faca04a..7f05bc1e0 100644
 --- a/tests/agent/test_anthropic_keychain.py
 +++ b/tests/agent/test_anthropic_keychain.py
 @@ -6,7 +6,11 @@ from unittest.mock import patch, MagicMock
@@ -2955,7 +3020,7 @@ index 97faca04..7f05bc1e 100644
          assert captured["refresh_token"] == "live-refresh"
 -
 diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
-index 68a92335..c2d2ec63 100644
+index 68a923355..c2d2ec63c 100644
 --- a/tests/agent/test_credential_pool.py
 +++ b/tests/agent/test_credential_pool.py
 @@ -1725,6 +1725,126 @@ def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path,
@@ -3086,7 +3151,7 @@ index 68a92335..c2d2ec63 100644
      """API-key auth path: autodiscovered OAuth creds must NOT be seeded.
  
 diff --git a/tests/agent/test_credential_pool_routing.py b/tests/agent/test_credential_pool_routing.py
-index 9c7c0473..d1c99d99 100644
+index 9c7c04730..d1c99d998 100644
 --- a/tests/agent/test_credential_pool_routing.py
 +++ b/tests/agent/test_credential_pool_routing.py
 @@ -5,7 +5,7 @@ Covers:
@@ -3143,13 +3208,14 @@ index 9c7c0473..d1c99d99 100644
          """Second consecutive 429 should rotate to next credential."""
 diff --git a/tests/agent/transports/test_claude_code_session.py b/tests/agent/transports/test_claude_code_session.py
 new file mode 100644
-index 00000000..8b3518fb
+index 000000000..4a98d1101
 --- /dev/null
 +++ b/tests/agent/transports/test_claude_code_session.py
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,561 @@
 +from __future__ import annotations
 +
 +import json
++import time
 +from datetime import datetime
 +from zoneinfo import ZoneInfo
 +
@@ -3199,6 +3265,137 @@ index 00000000..8b3518fb
 +    def kill(self):
 +        self.killed = True
 +        self.returncode = -9
++
++
++class _ScheduledProcess:
++    """Fake claude process whose stdout arrives on a schedule.
++
++    Unlike _FakeProcess it stays alive after its last line, so a turn can be
++    observed going silent without the stream reaching EOF.
++    """
++
++    def __init__(self, timed_lines):
++        self.stdin = _FakeInput()
++        self.stderr = []
++        self.returncode = 0
++        self.terminated = False
++        self.killed = False
++        self.stdout = self._emit(list(timed_lines))
++
++    def _emit(self, timed_lines):
++        for delay, line in timed_lines:
++            time.sleep(delay)
++            if self._stopped():
++                return
++            yield line
++        while not self._stopped():
++            time.sleep(0.02)
++
++    def _stopped(self):
++        return self.terminated or self.killed
++
++    def poll(self):
++        return self.returncode if self._stopped() else None
++
++    def wait(self, timeout=None):
++        return self.returncode
++
++    def terminate(self):
++        self.terminated = True
++        self.returncode = -15
++
++    def kill(self):
++        self.killed = True
++        self.returncode = -9
++
++
++def _session_over(monkeypatch, tmp_path, process):
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.shutil.which",
++        lambda _: "/usr/bin/claude",
++    )
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.subprocess.Popen",
++        lambda *args, **kwargs: process,
++    )
++    return ClaudeCodeSession(
++        claude_config_dir=str(tmp_path / "claude-account"),
++        cwd=str(tmp_path),
++        model="claude-test",
++        expose_hermes_tools=False,
++    )
++
++
++def test_silent_turn_is_cut_by_the_idle_budget(monkeypatch, tmp_path):
++    process = _ScheduledProcess([])
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=30.0, idle_timeout=1.0)
++
++    assert result.status_code == 504
++    assert "went silent for 1s" in result.error
++    assert result.should_retire is True
++    assert process.terminated is True
++
++
++def test_streaming_activity_refreshes_the_idle_budget(monkeypatch, tmp_path):
++    # Streams for ~2s with no gap wider than 0.2s. Under the old wall-clock
++    # deadline this turn died; it must now survive, because it is never silent.
++    lines = [(0.2, _line({"type": "stream_event", "event": {}})) for _ in range(10)]
++    lines.append(
++        (0.05, _line({"type": "result", "subtype": "success", "result": "done"}))
++    )
++    process = _ScheduledProcess(lines)
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=30.0, idle_timeout=1.0)
++
++    assert result.error is None
++    assert result.final_text == "done"
++    assert process.terminated is False
++
++
++def test_ceiling_still_cuts_a_turn_that_never_goes_silent(monkeypatch, tmp_path):
++    # A wedged tool keeps emitting progress, so the idle budget never expires.
++    # Only the absolute ceiling can end this turn.
++    lines = [(0.05, _line({"type": "tool_progress", "tool_name": "Bash"}))] * 200
++    process = _ScheduledProcess(lines)
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=1.0, idle_timeout=30.0)
++
++    assert result.status_code == 504
++    assert "exceeded its 1s ceiling" in result.error
++    assert process.terminated is True
++
++
++def test_cut_turn_delivers_the_work_it_already_produced(monkeypatch, tmp_path):
++    # Regression for the production symptom: a turn cut after real work
++    # reached the user as a bare 37-character error string.
++    answer = "Merged three PRs and pushed the spanset spec."
++    process = _ScheduledProcess(
++        [
++            (
++                0.05,
++                _line(
++                    {
++                        "type": "assistant",
++                        "message": {
++                            "role": "assistant",
++                            "content": [{"type": "text", "text": answer}],
++                        },
++                    }
++                ),
++            )
++        ]
++    )
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=30.0, idle_timeout=1.0)
++
++    assert result.error is not None
++    assert answer in result.final_text
++    assert result.error in result.final_text
 +
 +
 +def test_streams_text_and_projects_native_tool_history(monkeypatch, tmp_path):
@@ -3577,7 +3774,7 @@ index 00000000..8b3518fb
 +        "browser"
 +    ]
 diff --git a/tests/agent/transports/test_hermes_tools_mcp_server.py b/tests/agent/transports/test_hermes_tools_mcp_server.py
-index c61e6c68..4815e777 100644
+index c61e6c684..4815e777c 100644
 --- a/tests/agent/transports/test_hermes_tools_mcp_server.py
 +++ b/tests/agent/transports/test_hermes_tools_mcp_server.py
 @@ -46,15 +46,16 @@ class TestModuleSurface:
@@ -3708,7 +3905,7 @@ index c61e6c68..4815e777 100644
 +        ("mcp__example__lookup", {"query": "needle", "limit": 2})
 +    ]
 diff --git a/tests/gateway/test_kanban_notifier.py b/tests/gateway/test_kanban_notifier.py
-index 22c70e1c..9605b5c1 100644
+index 22c70e1c3..9605b5c1a 100644
 --- a/tests/gateway/test_kanban_notifier.py
 +++ b/tests/gateway/test_kanban_notifier.py
 @@ -1,19 +1,25 @@
@@ -3848,7 +4045,7 @@ index 22c70e1c..9605b5c1 100644
      db_path = tmp_path / "adapter-disconnect.db"
      monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
 diff --git a/tests/gateway/test_session_env.py b/tests/gateway/test_session_env.py
-index f5392ab2..ffda4bbd 100644
+index f5392ab2c..ffda4bbdc 100644
 --- a/tests/gateway/test_session_env.py
 +++ b/tests/gateway/test_session_env.py
 @@ -244,6 +244,36 @@ def test_set_session_env_includes_session_key():
@@ -3894,7 +4091,7 @@ index f5392ab2..ffda4bbd 100644
          runner._shutdown_executor()
 -
 diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
-index f2e65dd6..fd9f1064 100644
+index f2e65dd6c..fd9f10643 100644
 --- a/tests/hermes_cli/test_auth_commands.py
 +++ b/tests/hermes_cli/test_auth_commands.py
 @@ -1811,6 +1811,15 @@ def test_credential_sources_find_step_returns_none_for_manual():
@@ -3915,7 +4112,7 @@ index f2e65dd6..fd9f1064 100644
      generic env-var step.  The copilot step handles the duplicate-source
 diff --git a/tests/run_agent/test_claude_code_runtime.py b/tests/run_agent/test_claude_code_runtime.py
 new file mode 100644
-index 00000000..3ee061e1
+index 000000000..3ee061e17
 --- /dev/null
 +++ b/tests/run_agent/test_claude_code_runtime.py
 @@ -0,0 +1,362 @@
@@ -4282,7 +4479,7 @@ index 00000000..3ee061e1
 +    assert result["partial"] is True
 +    agent._recover_with_credential_pool.assert_not_called()
 diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
-index afb45a53..3d6ebf79 100644
+index afb45a53a..3d6ebf790 100644
 --- a/tests/run_agent/test_run_agent.py
 +++ b/tests/run_agent/test_run_agent.py
 @@ -2497,6 +2497,71 @@ class TestRetryAfterCap:
@@ -4413,7 +4610,7 @@ index afb45a53..3d6ebf79 100644
  
      def test_recover_with_pool_refreshes_on_401(self, agent):
 diff --git a/website/docs/user-guide/features/credential-pools.md b/website/docs/user-guide/features/credential-pools.md
-index 5d8503b3..a4a5ea45 100644
+index 5d8503b3a..a4a5ea453 100644
 --- a/website/docs/user-guide/features/credential-pools.md
 +++ b/website/docs/user-guide/features/credential-pools.md
 @@ -190,6 +190,43 @@ Hermes automatically discovers credentials from multiple sources and seeds the p

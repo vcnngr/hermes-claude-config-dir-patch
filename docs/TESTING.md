@@ -1,5 +1,40 @@
 # Testing
 
+## Turn-timeout fix
+
+Measured on the production host before changing anything: `134` occurrences of
+`Claude Code turn timed out after 900s` across `555` Kanban task logs, with
+`108` cards hitting at least one — **19.5%**. Steady at 1–16 per day over
+twelve days, so not a datable regression. One card (`t_6c2f6633`) took three
+consecutive hits: 45 minutes burned, restarting from scratch each time. The
+interactive gateway path is far milder — `14` of `1195` turns, 1.2% — because
+Telegram turns are short; the damage concentrates in long agentic Kanban work.
+
+Kanban card budgets in `kanban.db` cluster at 1800–3600s, so the turn wall was
+2–4× lower than the runtime allowance the board hands the card.
+
+The delivered symptom is worth recording because it is easy to misread in
+logs: the error string is exactly 37 characters, so a timed-out turn appears as
+`response ready: time=903.5s api_calls=1 response=37 chars` — a plausible-looking
+short answer, not an obvious failure.
+
+Three regression tests cover the new behaviour, plus one for a defect the tests
+themselves exposed: the loop kept waiting for stream EOF after the terminal
+`result` payload, so a completed turn whose process was slow to exit could be
+flipped into a timeout and its answer discarded. That is the same failure mode
+as upstream #58432 and is now ended at the `result` payload.
+
+Suite counts with the fix, v0.18.2 / v0.19.0:
+
+| Group | v0.18.2 | v0.19.0 |
+|---|---|---|
+| adapter/pool/runtime/MCP | `136` + `575` | `144` + `589` |
+| credential hydration | `342` | `348` |
+| gateway/Kanban/runtime | `171` | `194` |
+
+Both patches also pass `git apply --check` forward on pristine checkouts of
+their respective bases.
+
 ## v0.19.0 port result
 
 Ported onto a throwaway clone of upstream `v2026.7.20` (`3ef6bbd2`); the local

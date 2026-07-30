@@ -55,6 +55,21 @@ served a live turn.
   the pool, so a weekly cap freezes that row until it actually lifts instead of
   re-entering the pool after the generic one-hour 429 cooldown. Unparsable or
   implausible reset times fall back to that cooldown.
+- A turn is bounded by silence, not by wall clock. Claude Code streams
+  continuously — token deltas, tool starts, `tool_progress` heartbeats — so any
+  healthy turn refreshes its budget however long the work runs. A separate
+  absolute ceiling still ends a turn that never goes quiet, which idleness
+  alone cannot see: a wedged tool keeps emitting progress. Defaults are 900s of
+  silence and a 3600s ceiling, both overridable per call.
+- Work already produced survives a cut turn. A turn that ends early never emits
+  its terminal `result` payload, so the last completed assistant message is
+  promoted to the response instead of the caller receiving only an error
+  string. The turn is still reported as failed and partial — this is salvage,
+  not success.
+- The terminal `result` payload ends the turn immediately. Waiting for stream
+  EOF past it meant a finished turn whose process was slow to exit could still
+  trip a deadline and be reported as a failure, discarding an answer already in
+  hand.
 
 Non-default source ids become `claude_code:<8-char-directory-hash>`. The
 default directory keeps `source: "claude_code"`.
@@ -90,8 +105,8 @@ GitHub also provides source ZIP and TAR archives on the release page.
 Patch SHA-256, per base:
 
 ```text
-v0.18.2  fff28e857c27bb42e52b6a0053ea7b2dba05ae11b0c9ea246dbe0f8098bfd6c4
-v0.19.0  04ce19bf5c2268658d442761596b630be60bdb0469350b719b79894b24e1d91b
+v0.18.2  e73a243a6bf5d7a647d0d21398066fc6de78877e5f24055d09604a85405d9571
+v0.19.0  bec3fe956307aabcf226aad31f45202fe6bd274ff9d5d3ba91e0f9bec03c6be5
 ```
 
 ## Configure one Hermes profile
