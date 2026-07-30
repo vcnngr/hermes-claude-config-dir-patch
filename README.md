@@ -120,8 +120,8 @@ GitHub also provides source ZIP and TAR archives on the release page.
 Patch SHA-256, per base:
 
 ```text
-v0.18.2  ef6cf75c9b214cd461f3cbac6e8230ed05651a3e237bd34bc689285d011fac1d
-v0.19.0  dbfaa70206b762e37b5f1f23d1ae68947064d636abaea43f2a44bf24abee947f
+v0.18.2  497d641040a2b72a7cdd93b8108012f2aab4c73fafa1b075c3d9c290baf8da9c
+v0.19.0  3bf6a0ee3df30b95c4c744bd9d831ba4b862fccbeff3d9e68b25666d9572d1dd
 ```
 
 ## Configure one Hermes profile

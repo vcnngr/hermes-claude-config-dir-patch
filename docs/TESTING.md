@@ -49,6 +49,39 @@ deadline had the same exposure), and salvage can surface completed text that
 newer in-flight deltas were superseding. Both are documented in
 `docs/IMPLEMENTATION.md` rather than fixed.
 
+### Second review round
+
+The corrections were resubmitted for review. Two of them had introduced new
+defects, and one of the new tests proved nothing:
+
+- The `not saw_result` guard added for the delivered-answer case was too broad.
+  `saw_result` is set as soon as a `result` frame appears, before its content
+  is examined, so an empty `result` frame plus a nonzero exit passed both error
+  branches and became a **silent empty success**. Now gated on
+  `result.final_text` — a frame that carried nothing is not an answer.
+- Deriving "this was salvaged" from *error set and text present* was wrong: an
+  ordinary error result puts the same string in `final_text` and `error`, so
+  the caller rendered it twice — `X\n\n[X]` — including the subscription-cap
+  notice, whose readability was the point of fixing it in the first place.
+  There is now an explicit `salvaged` flag on the result.
+- `test_pending_output_is_not_mistaken_for_silence` passed with the queue guard
+  removed, so it proved nothing. Sleeping a little per frame cannot expire the
+  idle budget, because each dequeue refreshes it. Rewritten so one callback
+  blocks past the whole budget while the producer fills the queue behind it.
+  Verified by mutation: it now passes with the guard and fails without it.
+
+The idle predicate was also tightened. `empty()` alone is racy — the reader can
+enqueue just after it returns True — so expiry now requires two consecutive
+observations, giving the poll in between a chance to see what landed.
+
+Round-two suite counts, v0.18.2 / v0.19.0:
+
+| Group | v0.18.2 | v0.19.0 |
+|---|---|---|
+| adapter/pool/runtime/MCP | `141` + `575` | `149` + `589` |
+| credential hydration | `342` | `348` |
+| gateway/Kanban/runtime | `176` | `199` |
+
 Suite counts with the fix, v0.18.2 / v0.19.0:
 
 | Group | v0.18.2 | v0.19.0 |
