@@ -590,10 +590,10 @@ index a7f13ba..58282d9 100644
          existing = {}
 diff --git a/agent/claude_runtime.py b/agent/claude_runtime.py
 new file mode 100644
-index 0000000..11fcbd9
+index 0000000..8905cc7
 --- /dev/null
 +++ b/agent/claude_runtime.py
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,442 @@
 +"""Claude Code external-agent runtime.
 +
 +This path bypasses Hermes' model/tool loop.  Claude Code receives the complete
@@ -1011,11 +1011,16 @@ index 0000000..11fcbd9
 +
 +    usage_result = _record_claude_usage(agent, turn, api_calls=attempts)
 +    final_response = delivery_text or (turn.error or "")
-+    if turn.error is not None and delivery_text:
++    if getattr(turn, "salvaged", False) and delivery_text:
 +        # Work salvaged from a cut turn. Say so on the way out: partial output
 +        # delivered silently reads as a finished answer. The marker lives here
 +        # rather than in turn.final_text so the transcript de-duplication above
 +        # still matches the projected message it came from.
++        #
++        # Gated on the explicit flag, not on "error is set". An ordinary error
++        # result carries the same string in both final_text and error, so
++        # inferring salvage from their presence renders it twice — including
++        # the subscription-cap notice, whose whole point is to read cleanly.
 +        final_response = f"{delivery_text}\n\n[{turn.error}]"
 +    return {
 +        "final_response": final_response,
@@ -1389,10 +1394,10 @@ index 18f0823..78b26dd 100644
      ))
 diff --git a/agent/transports/claude_code_session.py b/agent/transports/claude_code_session.py
 new file mode 100644
-index 0000000..8b9ac8a
+index 0000000..ddbb731
 --- /dev/null
 +++ b/agent/transports/claude_code_session.py
-@@ -0,0 +1,787 @@
+@@ -0,0 +1,804 @@
 +"""Streaming Claude Code runtime for Hermes.
 +
 +Claude Code owns the agent loop and executes its native tools.  This module
@@ -1699,6 +1704,11 @@ index 0000000..8b9ac8a
 +    error: Optional[str] = None
 +    status_code: Optional[int] = None
 +    rate_limit_reset_at: Optional[float] = None
++    # True only when final_text was recovered from a cut turn rather than
++    # delivered by Claude. The caller needs this stated, not inferred: on an
++    # ordinary error final_text and error hold the same string, so "error is
++    # set and text is present" cannot distinguish the two.
++    salvaged: bool = False
 +    interrupted: bool = False
 +    should_retire: bool = False
 +    side_effects_possible: bool = False
@@ -1976,6 +1986,7 @@ index 0000000..8b9ac8a
 +        hard_deadline = time.monotonic() + max(float(timeout), 1.0)
 +        idle_deadline = time.monotonic() + idle_budget
 +        grace_deadline: Optional[float] = None
++        idle_strike = False
 +        reached_eof = False
 +        while not reached_eof and result.error is None:
 +            if self._interrupt_event.is_set():
@@ -1995,9 +2006,16 @@ index 0000000..8b9ac8a
 +                expiry = None
 +                # Pending input is proof of life that simply has not been
 +                # dequeued yet — a stalled consumer must not be read as a
-+                # silent producer.
++                # silent producer. `empty()` alone is a racy predicate: the
++                # reader can enqueue just after it returns True. Require two
++                # consecutive observations, so the poll below gets a chance to
++                # see anything that landed in between and refresh the budget.
 +                if now >= idle_deadline and stdout_queue.empty():
-+                    expiry = f"went silent for {idle_budget:.0f}s"
++                    if idle_strike:
++                        expiry = f"went silent for {idle_budget:.0f}s"
++                    idle_strike = True
++                else:
++                    idle_strike = False
 +                if now >= hard_deadline:
 +                    expiry = f"exceeded its {timeout:.0f}s ceiling"
 +                if expiry is not None:
@@ -2132,10 +2150,13 @@ index 0000000..8b9ac8a
 +        stderr_text = "\n".join(stderr_tail).strip()
 +        if self._interrupt_event.is_set() and result.error is None:
 +            result.interrupted = True
-+        elif return_code != 0 and result.error is None and not saw_result:
-+            # `not saw_result` matters: past the grace period above we may have
-+            # killed a lingering process ourselves, and a nonzero code from our
-+            # own kill must not retract an answer Claude already delivered.
++        elif return_code != 0 and result.error is None and not result.final_text:
++            # Gated on delivered text, not on `saw_result`. Past the grace
++            # period we may have killed a lingering process ourselves, and a
++            # nonzero code from our own kill must not retract an answer Claude
++            # delivered — but a `result` frame that carried nothing is not an
++            # answer, and suppressing the exit code for it would turn a genuine
++            # crash into a silent empty success.
 +            safe_error = redact_sensitive_text(
 +                stderr_text or "Claude Code exited without a result", force=True
 +            )
@@ -2170,6 +2191,7 @@ index 0000000..8b9ac8a
 +            # the transcript twice. The caller owns telling the user the turn
 +            # was cut; it has result.error for that.
 +            result.final_text = _last_assistant_text(result.projected_messages)
++            result.salvaged = bool(result.final_text)
 +
 +        return result
 +
@@ -3194,10 +3216,10 @@ index a23c228..243366c 100644
          """Second consecutive 429 should rotate to next credential."""
 diff --git a/tests/agent/transports/test_claude_code_session.py b/tests/agent/transports/test_claude_code_session.py
 new file mode 100644
-index 0000000..b300c16
+index 0000000..fb4216f
 --- /dev/null
 +++ b/tests/agent/transports/test_claude_code_session.py
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,699 @@
 +from __future__ import annotations
 +
 +import json
@@ -3377,20 +3399,95 @@ index 0000000..b300c16
 +
 +
 +def test_pending_output_is_not_mistaken_for_silence(monkeypatch, tmp_path):
-+    # Everything arrives at once and sits in the queue while the consumer is
-+    # still working. An idle check that ignored the queue would kill a healthy
-+    # process holding a full buffer.
-+    lines = [(0.0, _line({"type": "stream_event", "event": {}})) for _ in range(50)]
++    # The producer runs far ahead of the consumer: every frame is queued at
++    # once while a slow callback holds the reader up, so the idle budget
++    # expires with a full queue. An idle check that ignored the queue would
++    # kill a healthy process mid-backlog — this test fails if that guard is
++    # removed, which is the point of writing it this way.
++    text_frame = _line(
++        {
++            "type": "stream_event",
++            "event": {
++                "type": "content_block_delta",
++                "delta": {"type": "text_delta", "text": "x"},
++            },
++        }
++    )
++    lines = [(0.0, text_frame) for _ in range(40)]
 +    lines.append(
 +        (0.0, _line({"type": "result", "subtype": "success", "result": "done"}))
 +    )
 +    process = _ScheduledProcess(lines, linger=False)
-+    session = _session_over(monkeypatch, tmp_path, process)
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.shutil.which",
++        lambda _: "/usr/bin/claude",
++    )
++    monkeypatch.setattr(
++        "agent.transports.claude_code_session.subprocess.Popen",
++        lambda *args, **kwargs: process,
++    )
++
++    # One callback blocks past the whole idle budget. Sleeping a little per
++    # frame would prove nothing: each dequeue refreshes the budget, so it would
++    # never expire. The consumer has to be away long enough for the deadline to
++    # pass while the producer fills the queue behind it.
++    stalled = []
++
++    def _stall_once(_text):
++        if not stalled:
++            stalled.append(True)
++            time.sleep(1.4)
++
++    session = ClaudeCodeSession(
++        claude_config_dir=str(tmp_path / "claude-account"),
++        cwd=str(tmp_path),
++        model="claude-test",
++        expose_hermes_tools=False,
++        on_text_delta=_stall_once,
++    )
 +
 +    result = session.run_turn(prompt="hello", timeout=60.0, idle_timeout=1.0)
 +
 +    assert result.error is None
 +    assert result.final_text == "done"
++    assert process.terminated is False
++
++
++def test_empty_result_frame_does_not_mask_a_crash(monkeypatch, tmp_path):
++    # A `result` frame carrying nothing is not an answer. Suppressing the
++    # nonzero exit for it would turn a genuine crash into a silent success.
++    process = _FakeProcess([_line({"type": "result"})], returncode=1)
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=60.0, idle_timeout=30.0)
++
++    assert result.error is not None
++    assert result.final_text == ""
++
++
++def test_ordinary_error_is_not_flagged_as_salvage(monkeypatch, tmp_path):
++    # An error result puts the same string in final_text and error. Inferring
++    # salvage from "error set and text present" would make the caller render
++    # it twice — including the subscription-cap notice.
++    process = _FakeProcess(
++        [
++            _line(
++                {
++                    "type": "result",
++                    "subtype": "error_during_execution",
++                    "is_error": True,
++                    "result": "You've hit your weekly limit · resets Jul 31 at 4am",
++                }
++            )
++        ],
++        returncode=1,
++    )
++    session = _session_over(monkeypatch, tmp_path, process)
++
++    result = session.run_turn(prompt="hello", timeout=60.0, idle_timeout=30.0)
++
++    assert result.error is not None
++    assert result.salvaged is False
 +
 +
 +def test_ceiling_still_cuts_a_turn_that_never_goes_silent(monkeypatch, tmp_path):
@@ -3429,6 +3526,7 @@ index 0000000..b300c16
 +    # Verbatim, with no marker: the caller appends the reason, and a suffix
 +    # here would defeat its transcript de-duplication.
 +    assert result.final_text == answer
++    assert result.salvaged is True
 +
 +
 +def test_salvage_refuses_a_tool_execution_preamble(monkeypatch, tmp_path):
