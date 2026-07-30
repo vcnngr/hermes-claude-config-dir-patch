@@ -30,6 +30,42 @@ hermes update
 
 This reverses only tracked hunks from this patch. Never use a hard reset.
 
+`remove` reverses the patch named in the *current* manifest. If the checkout
+carries an older one it refuses with `patch cannot be reversed cleanly`, which
+is the guard working, not a failure. Recover the installed version from git
+history, confirm it reverses, and remove with that file:
+
+```bash
+git -C /path/to/hermes-claude-config-dir-patch show \
+  <commit>:patches/<version>/hermes-claude-config-dir-multipool.patch \
+  > /tmp/installed.patch
+cd ~/.hermes/hermes-agent
+git apply --check --reverse /tmp/installed.patch
+git apply --reverse /tmp/installed.patch
+rm -f agent/claude_runtime.py agent/transports/claude_code_session.py \
+      tests/agent/transports/test_claude_code_session.py \
+      tests/run_agent/test_claude_code_runtime.py
+```
+
+The four removals matter: those files are added by the patch, so reversing the
+diff leaves them behind as untracked residue.
+
+After `hermes update`, move the checkout to the manifest commit. The updater
+tracks upstream `main`, not the release tag, and the installer will refuse the
+base it lands on:
+
+```bash
+cd ~/.hermes/hermes-agent
+git checkout <upstream_commit from patches/manifest.json>
+```
+
+Do not size that gap with `git rev-list --count` — the checkout is shallow and
+the count lies. Use `git diff --stat` between the two commits.
+
+Note that `hermes update` regenerates the venv without `pytest`. Do not add it
+to a production install to run the suites; test in a clone and verify the
+installed tree by file identity against it.
+
 ## 3. Reapply or port
 
 After checking for equivalent upstream support, add the new base and patch to

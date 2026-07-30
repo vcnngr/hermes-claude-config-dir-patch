@@ -73,6 +73,48 @@ It is upstream's test and upstream's code path: the same test passes 6/6 on
 previously committed patch too. Re-run before treating a v0.19.0 group-2
 failure as a regression.
 
+## v0.19.0 live validation, 2026-07-30
+
+The local install was moved from `v0.18.2` to `v0.19.0` and the base is now
+live-validated. Sequence, with the gateway stopped throughout:
+
+1. Confirmed no Kanban card was `running` or `ready` before stopping anything.
+2. Timestamped backup of every `auth.json` and `config.yaml` — 27 files.
+3. Reversed the previously installed patch. The installer refused the new one
+   (`patch cannot be reversed cleanly`), correctly: the checkout carried the
+   older patch. The installed version was recovered from git history, verified
+   to reverse cleanly, and removed with that file.
+4. `hermes update`, then the base was moved to the manifest commit — see the
+   trap below.
+5. Installed the `v0.19.0` patch. `Overlapping: 0 file(s)`.
+6. Verified the installed tree byte-for-byte against the clone that had passed
+   the suites. The regenerated venv no longer carries `pytest`, and it was not
+   added to a production install; file identity is the stronger check anyway.
+7. Live turn on a throwaway profile seeded with two credential rows:
+
+   ```
+   $ hermes -p v19probe -z "Run the shell command: printf V19_OK…"
+   I don't see the shell command output yet — let me run it.
+   V19_OK                                                    (14s)
+   ```
+
+   Real turn through `acp://claude-code`, native Bash executed once, and the
+   multi-block delivery path exercised. Profile deleted; the other fourteen
+   were untouched.
+8. Restarted the `cz-claude` gateway: Telegram connected, no traceback.
+
+### Trap: `hermes update` does not stop on the release tag
+
+It tracks upstream `main`. Here it landed on `8defb9fd`, which the installer
+refused as an unsupported base — the fail-closed guard working. The gap is not
+small: `3ef6bbd2..8defb9fd` is 4745 files and ~439k lines, and the patch does
+not apply there. `git rev-list --count` reported `1`, which is wrong; the
+Hermes checkout is a shallow clone, so its ancestry counts are meaningless.
+Verify with `git diff --stat` between the two commits instead.
+
+The fix is to check out the commit named in `patches/manifest.json` after
+updating, before installing.
+
 ## v0.19.0 port result
 
 Ported onto a throwaway clone of upstream `v2026.7.20` (`3ef6bbd2`); the local
