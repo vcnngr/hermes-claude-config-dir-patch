@@ -64,12 +64,16 @@ served a live turn.
 - Work already produced survives a cut turn. A turn that ends early never emits
   its terminal `result` payload, so the last completed assistant message is
   promoted to the response instead of the caller receiving only an error
-  string. The turn is still reported as failed and partial — this is salvage,
-  not success.
-- The terminal `result` payload ends the turn immediately. Waiting for stream
-  EOF past it meant a finished turn whose process was slow to exit could still
-  trip a deadline and be reported as a failure, discarding an answer already in
-  hand.
+  string. Only standalone prose qualifies: text attached to a tool call is an
+  execution preamble, and delivering "I'll delete the obsolete files now" as an
+  outcome would report work that may never have happened. The turn is still
+  reported as failed and partial — this is salvage, not success.
+- A delivered answer is never retracted. Once the terminal `result` arrives the
+  deadlines stop applying, and the stream is drained for a short grace period
+  so nothing that follows is lost. A nonzero exit after that point does not
+  become an error either, since past the grace period the process was killed by
+  us. Previously a finished turn whose process was slow to exit could still be
+  reported as a failure, discarding an answer already in hand.
 
 Non-default source ids become `claude_code:<8-char-directory-hash>`. The
 default directory keeps `source: "claude_code"`.
@@ -105,8 +109,8 @@ GitHub also provides source ZIP and TAR archives on the release page.
 Patch SHA-256, per base:
 
 ```text
-v0.18.2  e73a243a6bf5d7a647d0d21398066fc6de78877e5f24055d09604a85405d9571
-v0.19.0  bec3fe956307aabcf226aad31f45202fe6bd274ff9d5d3ba91e0f9bec03c6be5
+v0.18.2  ef6cf75c9b214cd461f3cbac6e8230ed05651a3e237bd34bc689285d011fac1d
+v0.19.0  dbfaa70206b762e37b5f1f23d1ae68947064d636abaea43f2a44bf24abee947f
 ```
 
 ## Configure one Hermes profile

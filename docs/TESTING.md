@@ -18,22 +18,60 @@ logs: the error string is exactly 37 characters, so a timed-out turn appears as
 `response ready: time=903.5s api_calls=1 response=37 chars` — a plausible-looking
 short answer, not an obvious failure.
 
-Three regression tests cover the new behaviour, plus one for a defect the tests
-themselves exposed: the loop kept waiting for stream EOF after the terminal
-`result` payload, so a completed turn whose process was slow to exit could be
-flipped into a timeout and its answer discarded. That is the same failure mode
-as upstream #58432 and is now ended at the `result` payload.
+Seven regression tests cover the behaviour. An adversarial review of the first
+draft (Codex, static analysis) raised nine findings; the four that survived
+verification against the code are worth recording, because each was a real
+defect the original tests could not have caught:
+
+- Breaking out of the loop at the terminal `result` was unsafe. The Agent SDK
+  models `result` as ending a *turn*, not necessarily the run, so frames can
+  legitimately follow. Replaced with: stop enforcing deadlines after `result`,
+  keep draining for a grace period.
+- With that break, a `result` followed by a slow exit hit `proc.wait(timeout=5)`
+  → `kill()` → nonzero return code → error, status 500. A delivered answer was
+  converted into a failure. Now guarded by `not saw_result`.
+- Salvage promoted text attached to `tool_calls`. Since
+  `_compose_claude_delivery_text` explicitly treats that as an execution
+  preamble, a cut turn could deliver "I'll delete the obsolete files now" as
+  its outcome. Salvage now requires standalone prose.
+- Appending the reason to `final_text` defeated the caller's transcript
+  de-duplication, which compares for equality, writing the same prose twice.
+  The marker moved to the caller's response composition.
+
+The test fake was also wrong in a way that hid the second point: its `wait()`
+returned 0 while the process was still alive, so the wait/kill path was never
+exercised. It now raises `TimeoutExpired`, and models both real behaviours —
+exiting after `result`, or lingering.
+
+Two findings were verified as pre-existing rather than introduced here: a
+blocking synchronous callback can stall both deadlines (the original single
+deadline had the same exposure), and salvage can surface completed text that
+newer in-flight deltas were superseding. Both are documented in
+`docs/IMPLEMENTATION.md` rather than fixed.
 
 Suite counts with the fix, v0.18.2 / v0.19.0:
 
 | Group | v0.18.2 | v0.19.0 |
 |---|---|---|
-| adapter/pool/runtime/MCP | `136` + `575` | `144` + `589` |
+| adapter/pool/runtime/MCP | `139` + `575` | `147` + `589` |
 | credential hydration | `342` | `348` |
-| gateway/Kanban/runtime | `171` | `194` |
+| gateway/Kanban/runtime | `174` | `197` |
+
+The seven timing-sensitive tests were run five times consecutively with no
+flake. Margins are deliberately wide — a 0.2s stream gap against a 2s idle
+budget — rather than tight enough to be scheduler-dependent.
 
 Both patches also pass `git apply --check` forward on pristine checkouts of
 their respective bases.
+
+### Known flaky test on v0.19.0
+
+`tests/run_agent/test_run_agent.py::TestRetryAfterCap::test_multi_pool_rotates_before_retry_after_sleep`
+fails intermittently on the `v0.19.0` base — roughly one run in three to six.
+It is upstream's test and upstream's code path: the same test passes 6/6 on
+`v0.18.2` both with and without this patch, and fails on `v0.19.0` with the
+previously committed patch too. Re-run before treating a v0.19.0 group-2
+failure as a regression.
 
 ## v0.19.0 port result
 
