@@ -64,14 +64,47 @@ budget — rather than tight enough to be scheduler-dependent.
 Both patches also pass `git apply --check` forward on pristine checkouts of
 their respective bases.
 
-### Known flaky test on v0.19.0
+### Retracted: the "flaky test on v0.19.0"
 
-`tests/run_agent/test_run_agent.py::TestRetryAfterCap::test_multi_pool_rotates_before_retry_after_sleep`
-fails intermittently on the `v0.19.0` base — roughly one run in three to six.
-It is upstream's test and upstream's code path: the same test passes 6/6 on
-`v0.18.2` both with and without this patch, and fails on `v0.19.0` with the
-previously committed patch too. Re-run before treating a v0.19.0 group-2
-failure as a regression.
+An earlier revision of this file recorded
+`TestRetryAfterCap::test_multi_pool_rotates_before_retry_after_sleep` as
+intermittently failing on the `v0.19.0` base, and attributed it to upstream.
+That was wrong, and the cause was the test harness, not the code.
+
+Those runs executed `v0.19.0` source against the `v0.18.2` virtualenv, because
+`hermes update` had not been run yet. With the venv matched to the base, the
+test passes 20/20 in isolation and the whole group passes.
+
+The full suite on the production install after the upgrade:
+
+| Group | Result |
+|---|---|
+| adapter/pool/runtime/MCP | `147` |
+| runtime provider + run_agent | `589` |
+| credential hydration | `348` |
+| gateway/Kanban/runtime | `197` |
+
+1281 tests, no failures. There is no known flaky test on either base.
+
+### Running the suites after `hermes update`
+
+The regenerated venv has no dev dependencies, and `pytest` must not be
+installed into a production install to work around that. Build a separate
+harness and put it on `PYTHONPATH` so Hermes' own dependencies still come from
+its venv:
+
+```bash
+python3 -m venv /tmp/hermes-testvenv
+/tmp/hermes-testvenv/bin/pip install pytest==9.0.2 pytest-asyncio==1.3.0
+SP=$(ls -d /tmp/hermes-testvenv/lib/python*/site-packages)
+cd ~/.hermes/hermes-agent
+env -u CLAUDE_CONFIG_DIR PYTHONPATH="$SP" venv/bin/python -m pytest -q <targets>
+```
+
+Pin both to the versions in `pyproject.toml`'s `dev` extra. `pytest-asyncio` is
+not optional: without it every async test fails with
+`PytestUnknownMarkWarning: Unknown pytest.mark.asyncio`, which looks like 14
+gateway failures and is not.
 
 ## v0.19.0 live validation, 2026-07-30
 
