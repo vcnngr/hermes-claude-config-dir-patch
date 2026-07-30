@@ -55,6 +55,25 @@ served a live turn.
   the pool, so a weekly cap freezes that row until it actually lifts instead of
   re-entering the pool after the generic one-hour 429 cooldown. Unparsable or
   implausible reset times fall back to that cooldown.
+- A turn is bounded by silence, not by wall clock. Claude Code streams
+  continuously — token deltas, tool starts, `tool_progress` heartbeats — so any
+  healthy turn refreshes its budget however long the work runs. A separate
+  absolute ceiling still ends a turn that never goes quiet, which idleness
+  alone cannot see: a wedged tool keeps emitting progress. Defaults are 900s of
+  silence and a 3600s ceiling, both overridable per call.
+- Work already produced survives a cut turn. A turn that ends early never emits
+  its terminal `result` payload, so the last completed assistant message is
+  promoted to the response instead of the caller receiving only an error
+  string. Only standalone prose qualifies: text attached to a tool call is an
+  execution preamble, and delivering "I'll delete the obsolete files now" as an
+  outcome would report work that may never have happened. The turn is still
+  reported as failed and partial — this is salvage, not success.
+- A delivered answer is never retracted. Once the terminal `result` arrives the
+  deadlines stop applying, and the stream is drained for a short grace period
+  so nothing that follows is lost. A nonzero exit after that point does not
+  become an error either, since past the grace period the process was killed by
+  us. Previously a finished turn whose process was slow to exit could still be
+  reported as a failure, discarding an answer already in hand.
 
 Non-default source ids become `claude_code:<8-char-directory-hash>`. The
 default directory keeps `source: "claude_code"`.
@@ -90,8 +109,8 @@ GitHub also provides source ZIP and TAR archives on the release page.
 Patch SHA-256, per base:
 
 ```text
-v0.18.2  fff28e857c27bb42e52b6a0053ea7b2dba05ae11b0c9ea246dbe0f8098bfd6c4
-v0.19.0  04ce19bf5c2268658d442761596b630be60bdb0469350b719b79894b24e1d91b
+v0.18.2  ef6cf75c9b214cd461f3cbac6e8230ed05651a3e237bd34bc689285d011fac1d
+v0.19.0  dbfaa70206b762e37b5f1f23d1ae68947064d636abaea43f2a44bf24abee947f
 ```
 
 ## Configure one Hermes profile

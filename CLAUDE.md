@@ -13,13 +13,13 @@ Supported state (the installer matches the checkout's exact `HEAD`):
 - Hermes: `v0.19.0 (2026.7.20)`
 - upstream: `3ef6bbd201263d354fd83ec55b3c306ded2eb72a`
 - patch: `patches/v0.19.0/hermes-claude-config-dir-multipool.patch`
-- SHA-256: `04ce19bf5c2268658d442761596b630be60bdb0469350b719b79894b24e1d91b`
+- SHA-256: `dbfaa70206b762e37b5f1f23d1ae68947064d636abaea43f2a44bf24abee947f`
 - status: full automated suite green; no live turn served yet
 
 - Hermes: `v0.18.2 (2026.7.7.2)`
 - upstream: `226e8de827a669e8ffa7035b27d70c19e44b1208`
 - patch: `patches/v0.18.2/hermes-claude-config-dir-multipool.patch`
-- SHA-256: `fff28e857c27bb42e52b6a0053ea7b2dba05ae11b0c9ea246dbe0f8098bfd6c4`
+- SHA-256: `ef6cf75c9b214cd461f3cbac6e8230ed05651a3e237bd34bc689285d011fac1d`
 - status: live-validated; this is what the local install currently runs
 
 The patch also preserves durable gateway session identity across the external
