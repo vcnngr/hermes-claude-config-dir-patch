@@ -7,13 +7,24 @@ Supported bases:
 
 | Hermes | Upstream commit | Patch status |
 |---|---|---|
-| `v0.19.0 (2026.7.20)` | `3ef6bbd2` | Tested, automated only |
+| `v0.19.0 (2026.7.20)` | `3ef6bbd2` | Tested, live-validated |
 | `v0.18.2 (2026.7.7.2)` | `226e8de8` | Tested, live-validated |
 
 The installer selects the entry matching the checkout's exact `HEAD`, so both
-bases stay installable. `v0.18.2` additionally carries live end-to-end
-validation; `v0.19.0` has passed the full automated suite but has not yet
-served a live turn.
+bases stay installable and an older installation stays recoverable.
+
+`hermes update` does not stop on the release tag. It tracks upstream `main`,
+which is thousands of commits past it, so the patch will not apply and the
+installer refuses the base as unsupported. That refusal is the guard working.
+Check out the commit named in `patches/manifest.json` before installing:
+
+```bash
+cd ~/.hermes/hermes-agent
+git checkout 3ef6bbd201263d354fd83ec55b3c306ded2eb72a
+```
+
+Do not size that gap with `git rev-list --count` on the Hermes checkout: it is
+a shallow clone, and the count it returns is meaningless.
 
 ## What it adds
 
