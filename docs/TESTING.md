@@ -1,5 +1,109 @@
 # Testing
 
+## Turn-timeout fix
+
+Measured on the production host before changing anything: `134` occurrences of
+`Claude Code turn timed out after 900s` across `555` Kanban task logs, with
+`108` cards hitting at least one — **19.5%**. Steady at 1–16 per day over
+twelve days, so not a datable regression. One card (`t_6c2f6633`) took three
+consecutive hits: 45 minutes burned, restarting from scratch each time. The
+interactive gateway path is far milder — `14` of `1195` turns, 1.2% — because
+Telegram turns are short; the damage concentrates in long agentic Kanban work.
+
+Kanban card budgets in `kanban.db` cluster at 1800–3600s, so the turn wall was
+2–4× lower than the runtime allowance the board hands the card.
+
+The delivered symptom is worth recording because it is easy to misread in
+logs: the error string is exactly 37 characters, so a timed-out turn appears as
+`response ready: time=903.5s api_calls=1 response=37 chars` — a plausible-looking
+short answer, not an obvious failure.
+
+Seven regression tests cover the behaviour. An adversarial review of the first
+draft (Codex, static analysis) raised nine findings; the four that survived
+verification against the code are worth recording, because each was a real
+defect the original tests could not have caught:
+
+- Breaking out of the loop at the terminal `result` was unsafe. The Agent SDK
+  models `result` as ending a *turn*, not necessarily the run, so frames can
+  legitimately follow. Replaced with: stop enforcing deadlines after `result`,
+  keep draining for a grace period.
+- With that break, a `result` followed by a slow exit hit `proc.wait(timeout=5)`
+  → `kill()` → nonzero return code → error, status 500. A delivered answer was
+  converted into a failure. Now guarded by `not saw_result`.
+- Salvage promoted text attached to `tool_calls`. Since
+  `_compose_claude_delivery_text` explicitly treats that as an execution
+  preamble, a cut turn could deliver "I'll delete the obsolete files now" as
+  its outcome. Salvage now requires standalone prose.
+- Appending the reason to `final_text` defeated the caller's transcript
+  de-duplication, which compares for equality, writing the same prose twice.
+  The marker moved to the caller's response composition.
+
+The test fake was also wrong in a way that hid the second point: its `wait()`
+returned 0 while the process was still alive, so the wait/kill path was never
+exercised. It now raises `TimeoutExpired`, and models both real behaviours —
+exiting after `result`, or lingering.
+
+Two findings were verified as pre-existing rather than introduced here: a
+blocking synchronous callback can stall both deadlines (the original single
+deadline had the same exposure), and salvage can surface completed text that
+newer in-flight deltas were superseding. Both are documented in
+`docs/IMPLEMENTATION.md` rather than fixed.
+
+Suite counts with the fix, v0.18.2 / v0.19.0:
+
+| Group | v0.18.2 | v0.19.0 |
+|---|---|---|
+| adapter/pool/runtime/MCP | `139` + `575` | `147` + `589` |
+| credential hydration | `342` | `348` |
+| gateway/Kanban/runtime | `174` | `197` |
+
+The seven timing-sensitive tests were run five times consecutively with no
+flake. Margins are deliberately wide — a 0.2s stream gap against a 2s idle
+budget — rather than tight enough to be scheduler-dependent.
+
+Both patches also pass `git apply --check` forward on pristine checkouts of
+their respective bases.
+
+### Known flaky test on v0.19.0
+
+`tests/run_agent/test_run_agent.py::TestRetryAfterCap::test_multi_pool_rotates_before_retry_after_sleep`
+fails intermittently on the `v0.19.0` base — roughly one run in three to six.
+It is upstream's test and upstream's code path: the same test passes 6/6 on
+`v0.18.2` both with and without this patch, and fails on `v0.19.0` with the
+previously committed patch too. Re-run before treating a v0.19.0 group-2
+failure as a regression.
+
+## v0.19.0 port result
+
+Ported onto a throwaway clone of upstream `v2026.7.20` (`3ef6bbd2`); the local
+install stayed on `v0.18.2` throughout. Same four groups, run with the
+`v0.18.2` venv over `PYTHONPATH`:
+
+| Group | v0.18.2 | v0.19.0 |
+|---|---|---|
+| adapter/pool/runtime/MCP | `132` + `575` | `140` + `589` |
+| credential hydration | `342` | `348` |
+| gateway/Kanban/runtime | `167` | `190` |
+
+The higher counts are upstream's own added tests in the same files, not new
+downstream ones. `git apply --check` also passes forward on a pristine
+`v2026.7.20` checkout, which is the path the installer takes.
+
+Of 25 patched files, 24 applied unchanged. Only
+`agent/transports/hermes_tools_mcp_server.py` conflicted, 3 hunks of 11.
+
+One reconciliation is worth recording because a test caught it. Upstream
+independently solved the problem our `_apply_json_schema_signature()` existed
+for, via `_signature_from_schema()` — better, since it maps JSON types to
+Python types and sets annotations. Dropping our helper for theirs looks
+correct and is half right: their signature governs how FastMCP *invokes* the
+tool, while the schema FastMCP then derives from it is lossy — `minimum`,
+enum members, and descriptions do not survive the round-trip through Python
+annotations. `test_real_fastmcp_uses_authoritative_schema_and_normal_kwargs`
+fails on exactly that. The port therefore keeps upstream's signature synthesis
+*and* re-applies the post-registration `registered.parameters` override, which
+governs what the client sees. Both, not either.
+
 ## Automated regression suite
 
 Installer regression suite:

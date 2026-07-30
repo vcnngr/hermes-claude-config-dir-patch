@@ -1,8 +1,8 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index c5826b4b9..98570e31f 100644
+index 1eae555..ddb70d9 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -449,7 +449,7 @@ def init_agent(
+@@ -437,7 +437,7 @@ def init_agent(
      agent._credential_pool = credential_pool
      agent.acp_command = acp_command or command
      agent.acp_args = list(acp_args or args or [])
@@ -11,7 +11,7 @@ index c5826b4b9..98570e31f 100644
          agent.api_mode = api_mode
      elif agent.provider == "openai-codex":
          agent.api_mode = "codex_responses"
-@@ -892,6 +892,29 @@ def init_agent(
+@@ -917,6 +917,29 @@ def init_agent(
          agent.base_url = "moa://local"
          if not agent.quiet_mode:
              print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
@@ -42,10 +42,10 @@ index c5826b4b9..98570e31f 100644
          # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
          # Region is extracted from the base_url or defaults to us-east-1.
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 1cde73419..394191493 100644
+index 263cf15..7561b0a 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
-@@ -704,8 +704,8 @@ def recover_with_credential_pool(
+@@ -861,8 +861,8 @@ def recover_with_credential_pool(
      """Attempt credential recovery via pool rotation.
  
      Returns (recovered, has_retried_429).
@@ -56,7 +56,7 @@ index 1cde73419..394191493 100644
      On billing exhaustion: immediately rotates.
      On auth failures: attempts token refresh before rotating.
  
-@@ -841,7 +841,18 @@ def recover_with_credential_pool(
+@@ -1005,7 +1005,18 @@ def recover_with_credential_pool(
                  or "usage limit has been reached" in context_message
              )
          if not has_retried_429 and not usage_limit_reached:
@@ -76,7 +76,7 @@ index 1cde73419..394191493 100644
          rotate_status = status_code if status_code is not None else 429
          next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
          if next_entry is not None:
-@@ -855,6 +866,15 @@ def recover_with_credential_pool(
+@@ -1019,6 +1030,15 @@ def recover_with_credential_pool(
          return False, True
  
      if effective_reason == FailoverReason.auth:
@@ -93,7 +93,7 @@ index 1cde73419..394191493 100644
          # but refresh cannot fix them — the OAuth token is already valid,
          # the account simply lacks the entitlement.  Without this guard,
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
-index 689d01010..896a0bafd 100644
+index a7f13ba..58282d9 100644
 --- a/agent/anthropic_adapter.py
 +++ b/agent/anthropic_adapter.py
 @@ -11,6 +11,7 @@ Auth supports:
@@ -174,7 +174,7 @@ index 689d01010..896a0bafd 100644
  THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
  # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
  # Anthropic exposes 5 levels on 4.7+: low, medium, high, xhigh, max.
-@@ -869,12 +933,126 @@ def build_anthropic_bedrock_client(region: str):
+@@ -892,12 +956,126 @@ def build_anthropic_bedrock_client(region: str):
      )
  
  
@@ -305,7 +305,7 @@ index 689d01010..896a0bafd 100644
  
      The password field contains a JSON string with the same claudeAiOauth
      structure as the JSON file.
-@@ -884,61 +1062,152 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+@@ -907,61 +1085,152 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
      if platform.system() != "Darwin":
          return None
  
@@ -493,7 +493,7 @@ index 689d01010..896a0bafd 100644
          return None
  
      oauth_data = data.get("claudeAiOauth")
-@@ -952,15 +1221,19 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
+@@ -975,15 +1244,19 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
          "refreshToken": oauth_data.get("refreshToken", ""),
          "expiresAt": oauth_data.get("expiresAt", 0),
          "source": "claude_code_credentials_file",
@@ -517,7 +517,7 @@ index 689d01010..896a0bafd 100644
  
      Selection rules when both are present:
        - If exactly one is non-expired, prefer that one. (Handles the case
-@@ -976,8 +1249,18 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
+@@ -999,8 +1272,18 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
  
      Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
      """
@@ -538,7 +538,7 @@ index 689d01010..896a0bafd 100644
  
      if kc_creds and file_creds:
          kc_valid = is_claude_code_token_valid(kc_creds)
-@@ -1095,7 +1378,12 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+@@ -1118,7 +1401,12 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
      # no-op, and a 0/absent ``expiresAt`` means "managed key / unknown expiry"
      # (see is_claude_code_token_valid) which must NOT be treated as a fresh
      # refresh here.
@@ -552,7 +552,7 @@ index 689d01010..896a0bafd 100644
      if current:
          current_token = current.get("accessToken", "")
          current_exp = current.get("expiresAt", 0) or 0
-@@ -1115,11 +1403,15 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+@@ -1138,11 +1426,15 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
  
      try:
          refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
@@ -569,7 +569,7 @@ index 689d01010..896a0bafd 100644
          logger.debug("Successfully refreshed Claude Code OAuth token")
          return refreshed["access_token"]
      except Exception as e:
-@@ -1133,15 +1425,16 @@ def _write_claude_code_credentials(
+@@ -1156,15 +1448,16 @@ def _write_claude_code_credentials(
      expires_at_ms: int,
      *,
      scopes: Optional[list] = None,
@@ -590,7 +590,7 @@ index 689d01010..896a0bafd 100644
          existing = {}
 diff --git a/agent/claude_runtime.py b/agent/claude_runtime.py
 new file mode 100644
-index 000000000..11fcbd984
+index 0000000..11fcbd9
 --- /dev/null
 +++ b/agent/claude_runtime.py
 @@ -0,0 +1,437 @@
@@ -1032,10 +1032,10 @@ index 000000000..11fcbd984
 +
 +__all__ = ["run_claude_code_turn"]
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 12c80a8bf..72bfbe6ba 100644
+index 501e49b..8df84f1 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
-@@ -640,6 +640,18 @@ def run_conversation(
+@@ -718,6 +718,18 @@ def run_conversation(
              should_review_memory=_should_review_memory,
          )
  
@@ -1055,10 +1055,10 @@ index 12c80a8bf..72bfbe6ba 100644
          # Reset per-turn checkpoint dedup so each iteration can take one snapshot
          agent._checkpoint_mgr.new_turn()
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
-index 3bd594935..b25158ba2 100644
+index a968b3e..85a0067 100644
 --- a/agent/credential_pool.py
 +++ b/agent/credential_pool.py
-@@ -125,9 +125,15 @@ _EXTRA_KEYS = frozenset({
+@@ -147,9 +147,15 @@ _EXTRA_KEYS = frozenset({
      "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
      "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
      "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
@@ -1074,7 +1074,7 @@ index 3bd594935..b25158ba2 100644
  def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
      """Infer pool auth metadata for token formats with one unambiguous meaning."""
      if (
-@@ -181,6 +187,11 @@ class PooledCredential:
+@@ -203,6 +209,11 @@ class PooledCredential:
  
      @classmethod
      def from_dict(cls, provider: str, payload: Dict[str, Any]) -> "PooledCredential":
@@ -1086,7 +1086,7 @@ index 3bd594935..b25158ba2 100644
          field_names = {f.name for f in fields(cls) if f.name != "provider"}
          data = {k: payload.get(k) for k in field_names if k in payload}
          # Rehydrated last_status_at may be an ISO string from to_dict() — normalize to float epoch
-@@ -576,6 +587,14 @@ class CredentialPool:
+@@ -602,6 +613,14 @@ class CredentialPool:
          """True if at least one entry is not currently in exhaustion cooldown."""
          return bool(self._available_entries())
  
@@ -1101,7 +1101,7 @@ index 3bd594935..b25158ba2 100644
      def entries(self) -> List[PooledCredential]:
          return list(self._entries)
  
-@@ -660,11 +679,15 @@ class CredentialPool:
+@@ -686,11 +705,15 @@ class CredentialPool:
          writes the new pair to ~/.claude/.credentials.json. The pool entry's
          refresh token becomes stale. This method detects that and syncs.
          """
@@ -1119,7 +1119,7 @@ index 3bd594935..b25158ba2 100644
              if not creds:
                  return entry
              file_refresh = creds.get("refreshToken", "")
-@@ -1064,14 +1087,21 @@ class CredentialPool:
+@@ -1156,14 +1179,21 @@ class CredentialPool:
                  # Keep ~/.claude/.credentials.json in sync so that the
                  # fallback path (resolve_anthropic_token) and other profiles
                  # see the latest tokens.
@@ -1143,7 +1143,7 @@ index 3bd594935..b25158ba2 100644
                      except Exception as wexc:
                          logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
              elif self.provider == "openai-codex":
-@@ -1126,7 +1156,7 @@ class CredentialPool:
+@@ -1218,7 +1248,7 @@ class CredentialPool:
              # For anthropic claude_code entries: the refresh token may have been
              # consumed by another process. Check if ~/.claude/.credentials.json
              # has a newer token pair and retry once.
@@ -1152,7 +1152,7 @@ index 3bd594935..b25158ba2 100644
                  synced = self._sync_anthropic_entry_from_credentials_file(entry)
                  if synced.refresh_token != entry.refresh_token:
                      logger.debug("Retrying refresh with synced token from credentials file")
-@@ -1149,11 +1179,18 @@ class CredentialPool:
+@@ -1241,11 +1271,18 @@ class CredentialPool:
                          self._persist()
                          try:
                              from agent.anthropic_adapter import _write_claude_code_credentials
@@ -1172,7 +1172,7 @@ index 3bd594935..b25158ba2 100644
                          except Exception as wexc:
                              logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
                          return updated
-@@ -1435,12 +1472,15 @@ class CredentialPool:
+@@ -1527,12 +1564,15 @@ class CredentialPool:
              # Borrowed credentials persist as metadata-only references and are
              # hydrated from their live source on load.  A stale duplicate row
              # can remain unhydrated; never lease or select it as an empty key.
@@ -1190,7 +1190,7 @@ index 3bd594935..b25158ba2 100644
                      and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
                  synced = self._sync_anthropic_entry_from_credentials_file(entry)
                  if synced is not entry:
-@@ -1808,6 +1848,11 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
+@@ -1948,6 +1988,11 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
          "claude_code": 3,
          "env:ANTHROPIC_API_KEY": 4,
      }
@@ -1202,7 +1202,7 @@ index 3bd594935..b25158ba2 100644
      manual_entries = sorted(
          (entry for entry in entries if _is_manual_source(entry.source)),
          key=lambda entry: entry.priority,
-@@ -1815,7 +1860,7 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
+@@ -1955,7 +2000,7 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
      seeded_entries = sorted(
          (entry for entry in entries if not _is_manual_source(entry.source)),
          key=lambda entry: (
@@ -1211,7 +1211,7 @@ index 3bd594935..b25158ba2 100644
              entry.priority,
              entry.label,
          ),
-@@ -1891,36 +1936,129 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
+@@ -2031,36 +2076,129 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
              # transient 401 could revive them.
              retained = [
                  entry for entry in entries
@@ -1363,7 +1363,7 @@ index 3bd594935..b25158ba2 100644
      elif provider == "nous":
          state = _load_provider_state(auth_store, "nous")
 diff --git a/agent/credential_sources.py b/agent/credential_sources.py
-index 18f0823ba..78b26dd8c 100644
+index 18f0823..78b26dd 100644
 --- a/agent/credential_sources.py
 +++ b/agent/credential_sources.py
 @@ -197,9 +197,10 @@ def _remove_claude_code(provider: str, removed) -> RemovalResult:
@@ -1389,7 +1389,7 @@ index 18f0823ba..78b26dd8c 100644
      ))
 diff --git a/agent/transports/claude_code_session.py b/agent/transports/claude_code_session.py
 new file mode 100644
-index 000000000..8b9ac8a6a
+index 0000000..8b9ac8a
 --- /dev/null
 +++ b/agent/transports/claude_code_session.py
 @@ -0,0 +1,787 @@
@@ -2181,7 +2181,7 @@ index 000000000..8b9ac8a6a
 +    "build_turn_prompt",
 +]
 diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
-index 37f2d6179..fab294bb6 100644
+index 7fc23cf..07ac4f1 100644
 --- a/agent/transports/hermes_tools_mcp_server.py
 +++ b/agent/transports/hermes_tools_mcp_server.py
 @@ -1,15 +1,13 @@
@@ -2218,7 +2218,7 @@ index 37f2d6179..fab294bb6 100644
    - text_to_speech                       — TTS
    - kanban_* (complete/block/comment/    — kanban worker + orchestrator
      heartbeat/show/list/create/            handoff (stateless: read env var,
-@@ -28,23 +27,23 @@ What we DO NOT expose:
+@@ -28,18 +27,20 @@ What we DO NOT expose:
    - terminal / shell                     — codex's own shell tool
    - read_file / write_file / patch       — codex's apply_patch + shell
    - search_files / process               — codex's shell
@@ -2234,6 +2234,10 @@ index 37f2d6179..fab294bb6 100644
 +  - delegate_task                        — external runtimes own subagents
 +  - todo                                 — external runtimes own turn planning
 +
++memory and session_search are `_AGENT_LOOP_TOOLS` (model_tools.py):
++handle_function_call() cannot dispatch them without a live AIAgent, so
++_build_server() drives them directly against the profile's own stores.
++
 +Configured external MCP servers are discovered inside this subprocess and
 +re-exported too. This keeps profile-specific GitHub/wiki/etc. tools available
 +without copying their credentials into the external agent's command line.
@@ -2245,14 +2249,7 @@ index 37f2d6179..fab294bb6 100644
  """
  
  from __future__ import annotations
- 
- import json
-+import inspect
-+import keyword
- import logging
- import os
- import sys
-@@ -60,11 +59,8 @@ logger = logging.getLogger(__name__)
+@@ -104,11 +105,8 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
  #   - terminal / shell / read_file / write_file / patch / search_files /
  #     process — codex's built-ins cover these and approval routes through
  #     codex's own UI.
@@ -2266,7 +2263,7 @@ index 37f2d6179..fab294bb6 100644
  EXPOSED_TOOLS: tuple[str, ...] = (
      "web_search",
      "web_extract",
-@@ -82,6 +78,10 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+@@ -126,6 +124,10 @@ EXPOSED_TOOLS: tuple[str, ...] = (
      "image_generate",
      "skill_view",
      "skills_list",
@@ -2277,7 +2274,7 @@ index 37f2d6179..fab294bb6 100644
      "text_to_speech",
      # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
      # (set by the kanban dispatcher when spawning a worker). Without these
-@@ -105,6 +105,65 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+@@ -149,6 +151,36 @@ EXPOSED_TOOLS: tuple[str, ...] = (
  )
  
  
@@ -2311,39 +2308,10 @@ index 37f2d6179..fab294bb6 100644
 +    return [str(item) for item in parsed if str(item).strip()]
 +
 +
-+def _apply_json_schema_signature(fn: Any, schema: dict[str, Any]) -> None:
-+    """Give FastMCP an explicit callable signature for a JSON-schema tool.
-+
-+    FastMCP otherwise models ``def tool(**kwargs)`` as one required argument
-+    literally named ``kwargs``. The displayed schema is replaced with Hermes'
-+    authoritative schema after registration; this signature supplies the
-+    permissive per-field validation model used when FastMCP invokes the fn.
-+    """
-+    properties = schema.get("properties") or {}
-+    if not isinstance(properties, dict):
-+        properties = {}
-+    required = set(schema.get("required") or [])
-+    parameters = []
-+    for name in properties:
-+        if not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name):
-+            logger.warning("cannot expose MCP parameter with invalid Python name: %r", name)
-+            continue
-+        default = inspect.Parameter.empty if name in required else None
-+        parameters.append(
-+            inspect.Parameter(
-+                name,
-+                inspect.Parameter.KEYWORD_ONLY,
-+                default=default,
-+                annotation=Any,
-+            )
-+        )
-+    fn.__signature__ = inspect.Signature(parameters=parameters)
-+
-+
  def _build_server() -> Any:
      """Create the FastMCP server with Hermes tools attached. Lazy imports
      so the module can be imported without the mcp package installed
-@@ -116,7 +175,18 @@ def _build_server() -> Any:
+@@ -160,7 +192,18 @@ def _build_server() -> Any:
              f"hermes-tools MCP server requires the 'mcp' package: {exc}"
          ) from exc
  
@@ -2363,7 +2331,7 @@ index 37f2d6179..fab294bb6 100644
      from model_tools import (
          get_tool_definitions,
          handle_function_call,
-@@ -125,10 +195,10 @@ def _build_server() -> Any:
+@@ -169,10 +212,10 @@ def _build_server() -> Any:
      mcp = FastMCP(
          "hermes-tools",
          instructions=(
@@ -2377,7 +2345,7 @@ index 37f2d6179..fab294bb6 100644
              "memory, skills, and cross-session search."
          ),
      )
-@@ -137,13 +207,34 @@ def _build_server() -> Any:
+@@ -181,13 +224,34 @@ def _build_server() -> Any:
      # MCP clients see the same parameter docs Hermes gives the model.
      all_defs = {
          td["function"]["name"]: td["function"]
@@ -2414,54 +2382,44 @@ index 37f2d6179..fab294bb6 100644
          spec = all_defs.get(name)
          if spec is None:
              logger.debug(
-@@ -159,20 +250,33 @@ def _build_server() -> Any:
-         # the result string. We use add_tool() for full control over the
-         # input schema (FastMCP's @tool() decorator inspects type hints,
-         # which we can't get from a JSON schema at runtime).
--        def _make_handler(tool_name: str):
-+        def _make_handler(tool_name: str, tool_description: str):
+@@ -207,10 +271,27 @@ def _build_server() -> Any:
+             sig, annots = _signature_from_schema(schema)
+ 
              def _dispatch(**kwargs: Any) -> str:
 +                nonlocal memory_store
                  try:
+                     # Filter out None values before dispatch so unset optionals
+                     # aren't forwarded to the handler.
+                     args = {k: v for k, v in kwargs.items() if v is not None}
++                    # memory and session_search are _AGENT_LOOP_TOOLS: they are
++                    # not in the exclusion set, so the stateless expansion above
++                    # exposes them, but handle_function_call() cannot dispatch
++                    # them without a live AIAgent. Drive them directly against
++                    # the profile's own stores instead.
 +                    if tool_name == "session_search":
 +                        from tools.session_search_tool import session_search
 +
-+                        return session_search(**(kwargs or {}))
++                        return session_search(**args)
 +                    if tool_name == "memory":
 +                        from tools.memory_tool import MemoryStore, memory_tool
 +
 +                        if memory_store is None:
 +                            memory_store = MemoryStore()
 +                            memory_store.load_from_disk()
-+                        return memory_tool(store=memory_store, **(kwargs or {}))
-                     return handle_function_call(tool_name, kwargs or {})
++                        return memory_tool(store=memory_store, **args)
+                     return handle_function_call(tool_name, args or {})
                  except Exception as exc:
                      logger.exception("tool %s raised", tool_name)
-                     return json.dumps({"error": str(exc), "tool": tool_name})
-             _dispatch.__name__ = tool_name
--            _dispatch.__doc__ = description
-+            _dispatch.__doc__ = tool_description
-+            _apply_json_schema_signature(_dispatch, params_schema)
-             return _dispatch
- 
-         try:
-             mcp.add_tool(
--                _make_handler(name),
-+                _make_handler(name, description),
-                 name=name,
-                 description=description,
-                 # FastMCP accepts JSON schema directly via the
-@@ -181,15 +285,23 @@ def _build_server() -> Any:
-             )
-         except TypeError:
-             # Older mcp SDK signature — fall back to decorator-style.
--            handler = _make_handler(name)
-+            handler = _make_handler(name, description)
+@@ -235,12 +316,23 @@ def _build_server() -> Any:
+             handler = _make_handler(name, params_schema)
              handler = mcp.tool(name=name, description=description)(handler)
  
-+        # Current FastMCP has no public custom-input-schema parameter. Its
-+        # invocation model comes from the explicit signature above; replace
-+        # only the client-visible schema with Hermes' authoritative one.
++        # _signature_from_schema() above gives FastMCP a usable invocation
++        # model, but the schema FastMCP then derives from that signature is
++        # lossy: constraints like `minimum` and enum members do not survive the
++        # round-trip through Python annotations. FastMCP has no public
++        # custom-input-schema parameter, so replace only the client-visible
++        # schema with Hermes' authoritative one, leaving invocation untouched.
 +        manager = getattr(mcp, "_tool_manager", None)
 +        registered = manager.get_tool(name) if manager is not None else None
 +        if registered is not None:
@@ -2478,7 +2436,7 @@ index 37f2d6179..fab294bb6 100644
      return mcp
  
 diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
-index eb1c68ffd..3dd76a23e 100644
+index eb1c68f..3dd76a2 100644
 --- a/gateway/kanban_watchers.py
 +++ b/gateway/kanban_watchers.py
 @@ -15,6 +15,7 @@ import logging
@@ -2601,10 +2559,10 @@ index eb1c68ffd..3dd76a23e 100644
                                  # Best-effort: the notification itself already
                                  # delivered and the cursor has advanced, so a
 diff --git a/gateway/run.py b/gateway/run.py
-index d5b3fbff4..8494d8a2d 100644
+index f59e006..27e855c 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -15087,6 +15087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -16380,6 +16380,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              user_id=str(context.source.user_id) if context.source.user_id else "",
              user_name=str(context.source.user_name) if context.source.user_name else "",
              session_key=context.session_key,
@@ -2613,7 +2571,7 @@ index d5b3fbff4..8494d8a2d 100644
              profile=getattr(context.source, "profile", "") or "",
              async_delivery=_async_delivery,
 diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
-index a3a26b268..64b2ad839 100644
+index 6fee9b0..76e5d60 100644
 --- a/hermes_cli/runtime_provider.py
 +++ b/hermes_cli/runtime_provider.py
 @@ -340,6 +340,10 @@ _VALID_API_MODES = {
@@ -2666,10 +2624,10 @@ index a3a26b268..64b2ad839 100644
          base_url = base_url or OPENROUTER_BASE_URL
      elif provider == "xai":
 diff --git a/run_agent.py b/run_agent.py
-index fe378f396..1913c4221 100644
+index 6c13f73..06be64d 100644
 --- a/run_agent.py
 +++ b/run_agent.py
-@@ -2674,6 +2674,19 @@ class AIAgent:
+@@ -2811,6 +2811,19 @@ class AIAgent:
          """
          self._interrupt_requested = True
          self._interrupt_message = message
@@ -2689,7 +2647,7 @@ index fe378f396..1913c4221 100644
          # A cron turn performs its API request on the conversation thread to
          # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
          # path, its client is registered here so this cross-thread interrupt can
-@@ -3487,6 +3500,16 @@ class AIAgent:
+@@ -3624,6 +3637,16 @@ class AIAgent:
          """
          task_id = getattr(self, "session_id", None) or ""
  
@@ -2706,7 +2664,7 @@ index fe378f396..1913c4221 100644
          # 1. Kill background processes for this task
          try:
              from tools.process_registry import process_registry
-@@ -4517,6 +4540,16 @@ class AIAgent:
+@@ -4751,6 +4774,16 @@ class AIAgent:
          runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
          runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
  
@@ -2723,7 +2681,7 @@ index fe378f396..1913c4221 100644
          if self.api_mode == "anthropic_messages":
              from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
  
-@@ -4540,6 +4573,10 @@ class AIAgent:
+@@ -4774,6 +4807,10 @@ class AIAgent:
          self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
          self._client_kwargs["api_key"] = self.api_key
          self._client_kwargs["base_url"] = self.base_url
@@ -2734,7 +2692,7 @@ index fe378f396..1913c4221 100644
          self._apply_client_headers_for_base_url(self.base_url)
          self._replace_primary_openai_client(reason="credential_rotation")
  
-@@ -5836,6 +5873,29 @@ class AIAgent:
+@@ -6431,6 +6468,29 @@ class AIAgent:
          from agent.codex_runtime import run_codex_app_server_turn
          return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
  
@@ -2765,10 +2723,10 @@ index fe378f396..1913c4221 100644
      query: str = None,
      model: str = "",
 diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
-index febdf53a3..4454af8c9 100644
+index 982defc..dd70322 100644
 --- a/tests/agent/test_anthropic_adapter.py
 +++ b/tests/agent/test_anthropic_adapter.py
-@@ -229,7 +229,7 @@ class TestReadClaudeCodeCredentials:
+@@ -267,7 +267,7 @@ class TestReadClaudeCodeCredentials:
      def no_keychain(self, monkeypatch):
          monkeypatch.setattr(
              "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
@@ -2777,7 +2735,7 @@ index febdf53a3..4454af8c9 100644
          )
  
      def test_reads_valid_credentials(self, tmp_path, monkeypatch):
-@@ -249,6 +249,22 @@ class TestReadClaudeCodeCredentials:
+@@ -287,6 +287,22 @@ class TestReadClaudeCodeCredentials:
          assert creds["refreshToken"] == "sk-ant-oat01-refresh"
          assert creds["source"] == "claude_code_credentials_file"
  
@@ -2800,7 +2758,7 @@ index febdf53a3..4454af8c9 100644
      def test_ignores_primary_api_key_for_native_anthropic_resolution(self, tmp_path, monkeypatch):
          claude_json = tmp_path / ".claude.json"
          claude_json.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-primary"}))
-@@ -293,6 +309,13 @@ class TestIsClaudeCodeTokenValid:
+@@ -331,6 +347,13 @@ class TestIsClaudeCodeTokenValid:
  
  
  class TestResolveAnthropicToken:
@@ -2814,7 +2772,7 @@ index febdf53a3..4454af8c9 100644
      def test_prefers_oauth_token_over_api_key(self, monkeypatch, tmp_path):
          monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
          monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
-@@ -591,6 +614,20 @@ class TestWriteClaudeCodeCredentials:
+@@ -629,6 +652,20 @@ class TestWriteClaudeCodeCredentials:
          assert data["otherField"] == "keep-me"
          assert data["claudeAiOauth"]["accessToken"] == "new-tok"
  
@@ -2835,7 +2793,7 @@ index febdf53a3..4454af8c9 100644
      @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
      def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):
          """Refreshed Claude Code credentials must land on disk at 0o600.
-@@ -611,6 +648,14 @@ class TestWriteClaudeCodeCredentials:
+@@ -649,6 +686,14 @@ class TestWriteClaudeCodeCredentials:
  
  
  class TestResolveWithRefresh:
@@ -2850,7 +2808,7 @@ index febdf53a3..4454af8c9 100644
      def test_auto_refresh_on_expired_creds(self, monkeypatch, tmp_path):
          """When cred file has expired token + refresh token, auto-refresh is attempted."""
          monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-@@ -658,6 +703,13 @@ class TestResolveWithRefresh:
+@@ -696,6 +741,13 @@ class TestResolveWithRefresh:
  
  
  class TestRunOauthSetupToken:
@@ -2865,7 +2823,7 @@ index febdf53a3..4454af8c9 100644
          monkeypatch.setattr("shutil.which", lambda _: None)
          with pytest.raises(FileNotFoundError, match="claude.*CLI.*not installed"):
 diff --git a/tests/agent/test_anthropic_keychain.py b/tests/agent/test_anthropic_keychain.py
-index 97faca04a..7f05bc1e0 100644
+index 97faca0..7f05bc1 100644
 --- a/tests/agent/test_anthropic_keychain.py
 +++ b/tests/agent/test_anthropic_keychain.py
 @@ -6,7 +6,11 @@ from unittest.mock import patch, MagicMock
@@ -3048,7 +3006,7 @@ index 97faca04a..7f05bc1e0 100644
          assert captured["refresh_token"] == "live-refresh"
 -
 diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
-index 68a923355..c2d2ec63c 100644
+index 3e76470..7c6a792 100644
 --- a/tests/agent/test_credential_pool.py
 +++ b/tests/agent/test_credential_pool.py
 @@ -1725,6 +1725,126 @@ def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path,
@@ -3179,7 +3137,7 @@ index 68a923355..c2d2ec63c 100644
      """API-key auth path: autodiscovered OAuth creds must NOT be seeded.
  
 diff --git a/tests/agent/test_credential_pool_routing.py b/tests/agent/test_credential_pool_routing.py
-index 9c7c04730..d1c99d998 100644
+index a23c228..243366c 100644
 --- a/tests/agent/test_credential_pool_routing.py
 +++ b/tests/agent/test_credential_pool_routing.py
 @@ -5,7 +5,7 @@ Covers:
@@ -3236,7 +3194,7 @@ index 9c7c04730..d1c99d998 100644
          """Second consecutive 429 should rotate to next credential."""
 diff --git a/tests/agent/transports/test_claude_code_session.py b/tests/agent/transports/test_claude_code_session.py
 new file mode 100644
-index 000000000..b300c1600
+index 0000000..b300c16
 --- /dev/null
 +++ b/tests/agent/transports/test_claude_code_session.py
 @@ -0,0 +1,623 @@
@@ -3864,10 +3822,10 @@ index 000000000..b300c1600
 +        "browser"
 +    ]
 diff --git a/tests/agent/transports/test_hermes_tools_mcp_server.py b/tests/agent/transports/test_hermes_tools_mcp_server.py
-index c61e6c684..4815e777c 100644
+index c05e1de..851d2d2 100644
 --- a/tests/agent/transports/test_hermes_tools_mcp_server.py
 +++ b/tests/agent/transports/test_hermes_tools_mcp_server.py
-@@ -46,15 +46,16 @@ class TestModuleSurface:
+@@ -166,15 +166,16 @@ class TestModuleSurface:
              "vision_analyze",
              "image_generate",
              "skill_view",
@@ -3888,7 +3846,7 @@ index c61e6c684..4815e777c 100644
              assert agent_loop_tool not in EXPOSED_TOOLS, (
                  f"{agent_loop_tool!r} requires the agent loop context "
                  "and can't be reached through a stateless MCP callback"
-@@ -131,3 +132,105 @@ class TestMain:
+@@ -251,3 +252,105 @@ class TestMain:
          monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
          rc = m.main([])
          assert rc == 1
@@ -3995,7 +3953,7 @@ index c61e6c684..4815e777c 100644
 +        ("mcp__example__lookup", {"query": "needle", "limit": 2})
 +    ]
 diff --git a/tests/gateway/test_kanban_notifier.py b/tests/gateway/test_kanban_notifier.py
-index 22c70e1c3..9605b5c1a 100644
+index 22c70e1..9605b5c 100644
 --- a/tests/gateway/test_kanban_notifier.py
 +++ b/tests/gateway/test_kanban_notifier.py
 @@ -1,19 +1,25 @@
@@ -4135,7 +4093,7 @@ index 22c70e1c3..9605b5c1a 100644
      db_path = tmp_path / "adapter-disconnect.db"
      monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
 diff --git a/tests/gateway/test_session_env.py b/tests/gateway/test_session_env.py
-index f5392ab2c..ffda4bbdc 100644
+index f5392ab..ffda4bb 100644
 --- a/tests/gateway/test_session_env.py
 +++ b/tests/gateway/test_session_env.py
 @@ -244,6 +244,36 @@ def test_set_session_env_includes_session_key():
@@ -4181,10 +4139,10 @@ index f5392ab2c..ffda4bbdc 100644
          runner._shutdown_executor()
 -
 diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
-index f2e65dd6c..fd9f10643 100644
+index 02c2ac0..9e26da4 100644
 --- a/tests/hermes_cli/test_auth_commands.py
 +++ b/tests/hermes_cli/test_auth_commands.py
-@@ -1811,6 +1811,15 @@ def test_credential_sources_find_step_returns_none_for_manual():
+@@ -1903,6 +1903,15 @@ def test_credential_sources_find_step_returns_none_for_manual():
      assert find_removal_step("xai", "manual") is None
  
  
@@ -4202,7 +4160,7 @@ index f2e65dd6c..fd9f10643 100644
      generic env-var step.  The copilot step handles the duplicate-source
 diff --git a/tests/run_agent/test_claude_code_runtime.py b/tests/run_agent/test_claude_code_runtime.py
 new file mode 100644
-index 000000000..3ee061e17
+index 0000000..3ee061e
 --- /dev/null
 +++ b/tests/run_agent/test_claude_code_runtime.py
 @@ -0,0 +1,362 @@
@@ -4569,10 +4527,10 @@ index 000000000..3ee061e17
 +    assert result["partial"] is True
 +    agent._recover_with_credential_pool.assert_not_called()
 diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
-index afb45a53a..3d6ebf790 100644
+index 539dbdd..af05016 100644
 --- a/tests/run_agent/test_run_agent.py
 +++ b/tests/run_agent/test_run_agent.py
-@@ -2497,6 +2497,71 @@ class TestRetryAfterCap:
+@@ -2659,6 +2659,71 @@ class TestRetryAfterCap:
          status = self._drive_once(agent, 900)
          assert "Waiting 600.0s" in status
  
@@ -4644,7 +4602,7 @@ index afb45a53a..3d6ebf790 100644
  
  class TestConcurrentToolExecution:
      """Tests for _execute_tool_calls_concurrent and dispatch logic."""
-@@ -5961,13 +6026,16 @@ class TestCredentialPoolRecovery:
+@@ -6273,13 +6338,16 @@ class TestCredentialPoolRecovery:
          assert retry_same is False
          agent._swap_credential.assert_called_once_with(next_entry)
  
@@ -4662,7 +4620,7 @@ index afb45a53a..3d6ebf790 100644
              def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
                  assert status_code == 429
                  assert error_context is None
-@@ -5980,17 +6048,29 @@ class TestCredentialPoolRecovery:
+@@ -6292,17 +6360,29 @@ class TestCredentialPoolRecovery:
              status_code=429,
              has_retried_429=False,
          )
@@ -4700,7 +4658,7 @@ index afb45a53a..3d6ebf790 100644
  
      def test_recover_with_pool_refreshes_on_401(self, agent):
 diff --git a/website/docs/user-guide/features/credential-pools.md b/website/docs/user-guide/features/credential-pools.md
-index 5d8503b3a..a4a5ea453 100644
+index 5d8503b..a4a5ea4 100644
 --- a/website/docs/user-guide/features/credential-pools.md
 +++ b/website/docs/user-guide/features/credential-pools.md
 @@ -190,6 +190,43 @@ Hermes automatically discovers credentials from multiple sources and seeds the p

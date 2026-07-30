@@ -57,6 +57,52 @@ selected pool entry
   -> classify 401/429 and rotate before tool execution only
 ```
 
+Turn bounding sits in the same read loop. Two budgets run in parallel:
+
+```text
+idle_deadline   refreshed by every byte Claude emits   default  900s
+hard_deadline   refreshed by nothing                   default 3600s
+```
+
+Neither is sufficient alone. A wall-clock-only budget kills healthy long work,
+which is what the original single deadline did — it was set once before the
+loop and never reset. An idleness-only budget can never see a wedged turn,
+because a tool stuck in a loop still emits `tool_progress` heartbeats that
+would refresh it forever. The ceiling is aligned with the largest Kanban card
+budget in real use, so a card is no longer handed a runtime allowance its own
+turns cannot spend.
+
+The idle check also requires an empty queue. Pending input is proof of life
+that simply has not been dequeued yet, and a stalled consumer must not be read
+as a silent producer.
+
+Neither deadline can fire while a synchronous `on_text_delta` / `on_status`
+callback blocks, because the checks run on the same thread. This predates the
+two-budget model — the original single deadline had the same exposure — so the
+ceiling is a bound on Claude's behaviour, not an unconditional one on the
+caller's.
+
+Once the terminal `result` arrives, both deadlines stop applying and the stream
+is drained for `_POST_RESULT_GRACE` so nothing that follows is lost and the
+process can close its own pipe. A nonzero exit is likewise ignored after
+`saw_result`, since past the grace period the kill was ours. The rule is that a
+delivered answer is never retracted — the defect upstream fixed for the sibling
+runtime in #58432. Breaking out of the loop at `result` instead would be
+simpler and wrong: the Agent SDK models `result` as ending a turn, not
+necessarily the run, so frames can legitimately follow it.
+
+When a turn does end early it never emitted `result`, so `final_text` is empty
+and the caller would deliver only the error string. The last completed
+*standalone* assistant message is promoted into `final_text`. Text carrying
+`tool_calls` is skipped: `_compose_claude_delivery_text` treats it as an
+execution preamble, and salvage must not contradict that — an intention
+delivered as an outcome is worse than an honest error. The text is promoted
+verbatim, with no marker, so the caller's transcript de-duplication still
+matches the projected message it came from; the caller appends the reason when
+composing the user-facing response. The error stays set: unlike upstream's case
+— a complete answer missing only its completion event — a cut turn may have
+stopped mid-thought, so this is salvage, not success.
+
 Cap classification is part of that last step. Claude Code does not fail when
 the account is capped: the turn ends `exit 0`, `subtype: success`,
 `is_error: false`, and the cap notice arrives as the assistant's reply. A
