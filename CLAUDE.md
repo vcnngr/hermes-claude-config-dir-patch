@@ -10,11 +10,17 @@ This repository maintains a downstream Hermes patch for:
 
 Supported state (the installer matches the checkout's exact `HEAD`):
 
+- Hermes: `v0.20.1 (2026.8.13)`
+- upstream: `3d34b1916dac5bec5bbf9e9c0d3fd19e921728c0`
+- patch: `patches/v0.20.1/hermes-claude-config-dir-multipool.patch`
+- SHA-256: `1050ea650bc002cb00cb87e8c0a3fe32751b479e51800022180e2885a5d6bf35`
+- status: all four TESTING.md suites green; no live turn served yet
+
 - Hermes: `v0.19.0 (2026.7.20)`
 - upstream: `3ef6bbd201263d354fd83ec55b3c306ded2eb72a`
 - patch: `patches/v0.19.0/hermes-claude-config-dir-multipool.patch`
 - SHA-256: `3bf6a0ee3df30b95c4c744bd9d831ba4b862fccbeff3d9e68b25666d9572d1dd`
-- status: live-validated; this is what the local install currently runs
+- status: live-validated; superseded by v0.20.1, kept installable
 
 - Hermes: `v0.18.2 (2026.7.7.2)`
 - upstream: `226e8de827a669e8ffa7035b27d70c19e44b1208`

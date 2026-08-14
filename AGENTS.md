@@ -1,6 +1,7 @@
 # Maintainer instructions
 
-- Supported base: Hermes `v0.18.2 (2026.7.7.2)`, commit `226e8de8`.
+- Supported bases: Hermes `v0.20.1 (2026.8.13)` commit `3d34b191`, `v0.19.0
+  (2026.7.20)` commit `3ef6bbd2`, and `v0.18.2 (2026.7.7.2)` commit `226e8de8`.
 - Keep the patch minimal and versioned under `patches/<version>/`.
 - Never commit OAuth tokens, credential files, Keychain exports, fingerprints,
   real account labels, or absolute user paths.

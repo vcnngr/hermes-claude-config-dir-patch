@@ -181,6 +181,192 @@ Verify with `git diff --stat` between the two commits instead.
 The fix is to check out the commit named in `patches/manifest.json` after
 updating, before installing.
 
+## v0.20.1 port result
+
+Ported onto a throwaway clone of upstream `3d34b191` (`v0.20.1 (2026.8.13)`).
+The local install was already sitting on that commit, unpatched: an earlier
+`hermes update` had moved it there and taken the patch with it, while the
+gateways kept serving from the patched code still resident in memory. Nothing
+live was touched during the port.
+
+Upstream churn on the patched files is large — `gateway/run.py` alone moves
+±21,814 lines between `3ef6bbd2` and `3d34b191` — but the patch's own surface
+absorbed it well. `git apply --check` failed on 16 of 25 files; `--3way` left
+14 files with 17 conflicting hunks, 5 of them in source and the rest in tests.
+
+Upstream still has no native support: `claude_config_dir` / `CLAUDE_CONFIG_DIR`
+does not appear anywhere under `agent/`, `hermes_cli/`, `gateway/`, or
+`website/docs`, and `agent/transports/` has a `codex_app_server_session.py`
+with no Claude Code counterpart.
+
+Reconciliations worth recording:
+
+- `_read_claude_code_credentials_from_keychain` — upstream added
+  `encoding='utf-8', errors='replace'` to the `security` call at exactly the
+  point where the patch replaces the hardcoded service with the per-directory
+  service list. Both kept: the list from downstream, the decoding hardening
+  from upstream.
+- `gateway/kanban_watchers.py` — upstream rewrote the whole wake block (push
+  vs non-push delivery, `deliver_wake`, `chat_type` persisted on the
+  subscription row, pre-advance ordering with cursor rewind). The downstream
+  intent was re-expressed inside that structure rather than replacing it: the
+  origin recovered from the task's durable session id now *overrides* the
+  reconstructed `SessionSource` when it resolves to the same destination.
+  The v0.19.0 behaviour of refusing a non-matching origin was deliberately
+  dropped — with upstream's ordering the wake is the delivery on a wake-only
+  subscription, so refusing it loses the event. It now falls back to the
+  reconstruction, which upstream made faithful by persisting `chat_type`.
+- The origin lookup is wrapped so an absent or bare `session_store` degrades
+  to the reconstruction instead of raising. Upstream's own
+  `test_notifier_wakeup_uses_subscription_chat_type` builds a runner via
+  `GatewayRunner.__new__` with no store at all, and would otherwise have hit
+  the new lookup.
+- `run_agent.py` — upstream restructured `interrupt()` around a redirect lock
+  plus hard-cancel admission, and replaced `_apply_client_headers_for_base_url`
+  with `_reapply_route_client_config`, which also recomputes TLS material.
+  Both upstream shapes kept; the Claude Code session interrupt was re-added
+  alongside upstream's Codex branch, and the `claude_config_dir` client kwarg
+  is set before the route reapply (which only pops the `ssl_*` keys, so it
+  survives).
+
+`git apply --3way` anchored several hunks into the wrong place in files with
+heavy churn, presenting upstream-deleted code as a downstream addition. In
+`gateway/run.py` it spliced `_set_session_env` into the middle of the update
+streaming function; the real hunk there is a single line
+(`session_id=context.session_id`). In four test files it resurrected tests
+upstream had deleted, and in `tests/agent/test_credential_pool.py` it
+duplicated one. Every such hunk was discarded and reapplied by content.
+
+### A defect the port exposed
+
+`CredentialPool.has_available_alternative` — added by this patch, not upstream
+— read `self._available_entries()` as a single sequence. It returns the pair
+`(available, pending_refresh)`, so the method iterated the two lists
+themselves and raised `AttributeError: 'list' object has no attribute 'id'`
+on every 429 that reached it with a real pool; the `current is None` branch
+also returned True unconditionally, since a 2-tuple always has length 2. It
+did not take `self._lock`, which every other `_available_entries` caller must.
+
+Every v0.19.0 test stubbed the method, so the real implementation was never
+executed and the defect shipped. It is on the cap-failover path
+(`recover_with_credential_pool`), which is precisely the behaviour the Linux
+nodes are waiting for. Fixed here by destructuring the pair under the lock and
+reading the cursor through `_current_unlocked`.
+
+Three downstream tests needed rewriting rather than reapplying, because the
+behaviour they asserted had moved:
+
+- `test_first_429_rotates_when_alternative_is_available` asserted the old
+  `mark_exhausted_and_rotate(status_code, error_context)` signature; upstream
+  now also passes `api_key_hint` and `failure_reason`.
+- `test_multi_pool_rotates_before_retry_after_sleep` asserted
+  `time.sleep` was never called. Upstream now polls on sub-second backoffs
+  elsewhere, and with `time.sleep` patched those wall-clock-bounded waits spin
+  instead of blocking (≈44k calls of ≤0.05s). The assertion was narrowed to
+  the claim actually under test: no wait of a second or more. The same test
+  also had to set `agent.api_key` to the selected credential's key — upstream
+  attributes the failure by key rather than by the `current()` pointer, so the
+  placeholder fixture key benched the wrong entry and rotated back onto the
+  credential that had just 429'd.
+- `test_recover_with_single_pool_retries_first_429`'s pool stub gained
+  `entries()`, which upstream's recovery path now calls.
+
+### Adversarial review, and two defects it found
+
+The port was submitted to an independent review (Codex, read-only, against
+both the working tree and the generated patch). It cleared
+`anthropic_adapter.py`, `credential_pool.py`, `gateway/run.py`, and the
+interrupt merge in `run_agent.py`, and raised two substantive findings. Both
+were verified against the code before being accepted, and both are real:
+
+- **Kanban origin override discarded routing discriminators.** The
+  `_same_destination` predicate compared platform, chat, thread, `user_id`
+  and profile — but adopting the origin replaces upstream's reconstruction
+  *wholesale*, and that reconstruction also carries `chat_type`,
+  `user_id_alt` and `scope_id`. `build_session_key()` keys on all three:
+  Slack's `scope_id` comes *before* the chat and user ids, and participant
+  isolation prefers `user_id_alt` over `user_id`. So a stored origin from a
+  different workspace, or from a different member sharing a legacy
+  `user_id`, passed validation and was adopted — silently crossing the
+  tenant/participant boundary that upstream's `_wake_scope_id` exists to
+  enforce. The predicate now compares `scope_id` unconditionally, compares
+  the participant alt-first, and lets an *explicitly persisted* `chat_type`
+  veto. A row that never stated a `chat_type` still defers to the origin:
+  the reconstruction is only guessing `"group"` there, and that legacy row
+  is precisely the case this recovery exists to serve.
+- **`claude_config_dir` survived rotation onto a config-less entry.** Both
+  credential-swap branches assigned the kwarg only when the new entry had a
+  directory, and never cleared it otherwise. `_selected_claude_config_dir`
+  reads `_client_kwargs` before consulting the pool and falls back to
+  `~/.claude` only when the key is absent, so a benched account's directory
+  outranked the new credential's own identity — reachable with an ordinary
+  mixed pool, since API-key rows legitimately carry no directory. Both
+  branches now clear it. Like `has_available_alternative`, this is patch
+  text carried unchanged from v0.19.0, not something the port introduced.
+
+Four regression tests were added and each was verified by mutation — the
+predicate reverted to its pre-fix form fails all three Kanban tests, and
+removing the kwarg clear fails the rotation test.
+
+Three test-quality findings were also accepted:
+
+- The `long_waits` assertion in
+  `test_multi_pool_rotates_before_retry_after_sleep` proved nothing. The
+  Retry-After wait is a `while time.time() < sleep_end` loop polling the
+  interrupt flag every 200ms, so no single sleep is ever ≥ 1s and the
+  assertion held even when the wait *was* taken. It now counts 200ms polls:
+  honouring 900s needs ~4500, a rotation skips the loop. Mutation-checked by
+  forcing `has_available_alternative` to False — the test then spins on the
+  real backoff instead of passing, which is the regression shape.
+- `test_pool_exhaustion_returns_false` asserted only the return value, which
+  a path that never consulted the pool would also satisfy. It now pins that
+  `mark_exhausted_and_rotate` was attempted and that no swap followed.
+- The mismatch test's rationale cited wake-only delivery while configuring
+  `notify+wake`. The wording now says what the test actually pins — the
+  source substitution — and leaves the wake-only ordering to upstream's
+  tests.
+
+One finding was noted and not acted on: `test_credential_pool_routing.py`
+stubs the pool entirely, so it cannot catch a regression in the real
+`has_available_alternative`. That coverage lives in
+`test_run_agent.py::TestRetryAfterCap`, which drives a real `CredentialPool`
+— and is what surfaced the tuple-destructuring crash in the first place.
+
+Suite results on the ported clone, run with the `v0.20.1` venv over
+`PYTHONPATH`:
+
+| Group | v0.20.1 |
+|---|---|
+| adapter/pool/runtime/MCP | `120` |
+| runtime provider + run_agent | `301` |
+| credential hydration | `193` |
+| gateway/Kanban/runtime | `103` |
+
+717 tests, no failures. The totals are well below the v0.19.0 numbers, which
+is upstream restructuring rather than lost coverage — verified by collecting
+each shared file on a pristine `3d34b191` worktree and on the ported tree:
+
+| File | upstream | ported |
+|---|---|---|
+| `tests/agent/test_credential_pool.py` | 59 | 60 |
+| `tests/agent/test_anthropic_adapter.py` | 95 | 97 |
+| `tests/agent/test_anthropic_keychain.py` | 9 | 16 |
+| `tests/hermes_cli/test_auth_commands.py` | 19 | 20 |
+| `tests/agent/test_credential_pool_routing.py` | 17 | 17 |
+| `tests/run_agent/test_run_agent.py` | 244 | 246 |
+| `tests/gateway/test_kanban_notifier.py` | 9 | 12 |
+| `tests/gateway/test_session_env.py` | 9 | 10 |
+| `tests/agent/transports/test_hermes_tools_mcp_server.py` | 8 | 10 |
+
+Every file is at or above upstream. `test_credential_pool_routing.py` matches
+at 17 because the patch replaces upstream's
+`test_first_429_sets_retry_flag_no_rotation` with the downstream policy it
+contradicts — a rotation when an alternative exists.
+
+`git apply --check` passes forward on a pristine `3d34b191` worktree, and
+applying the generated patch there reproduces the tested tree byte-for-byte
+across all 25 files.
+
 ## v0.19.0 port result
 
 Ported onto a throwaway clone of upstream `v2026.7.20` (`3ef6bbd2`); the local

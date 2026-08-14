@@ -7,6 +7,7 @@ Supported bases:
 
 | Hermes | Upstream commit | Patch status |
 |---|---|---|
+| `v0.20.1 (2026.8.13)` | `3d34b191` | Tested, no live turn served yet |
 | `v0.19.0 (2026.7.20)` | `3ef6bbd2` | Tested, live-validated |
 | `v0.18.2 (2026.7.7.2)` | `226e8de8` | Tested, live-validated |
 
@@ -20,7 +21,7 @@ Check out the commit named in `patches/manifest.json` before installing:
 
 ```bash
 cd ~/.hermes/hermes-agent
-git checkout 3ef6bbd201263d354fd83ec55b3c306ded2eb72a
+git checkout 3d34b1916dac5bec5bbf9e9c0d3fd19e921728c0
 ```
 
 Do not size that gap with `git rev-list --count` on the Hermes checkout: it is
@@ -122,6 +123,7 @@ Patch SHA-256, per base:
 ```text
 v0.18.2  497d641040a2b72a7cdd93b8108012f2aab4c73fafa1b075c3d9c290baf8da9c
 v0.19.0  3bf6a0ee3df30b95c4c744bd9d831ba4b862fccbeff3d9e68b25666d9572d1dd
+v0.20.1  1050ea650bc002cb00cb87e8c0a3fe32751b479e51800022180e2885a5d6bf35
 ```
 
 ## Configure one Hermes profile
